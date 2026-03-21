@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: stripe-terminal-backend
+    env: ruby
+    region: oregon
+    plan: starter
+    buildCommand: bundle install
+    startCommand: bundle exec ruby web.rb
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: STRIPE_ENV
+        value: production
+      - key: RACK_ENV
+        value: production
+      - key: STRIPE_SECRET_KEY
+        sync: false # REQUIRED: Set your LIVE Stripe secret key (sk_live_...) in the dashboard
+      - key: STRIPE_TEST_SECRET_KEY
+        sync: false # Optional: Set your TEST Stripe secret key (sk_test_...) for development/testing
