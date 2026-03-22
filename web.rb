@@ -130,7 +130,7 @@ post '/register_reader' do
     return log_error("POST /register_reader", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /register_reader", stripe_account_id, "Step: registering reader")
 
   begin
@@ -173,7 +173,7 @@ post '/connection_token' do
     return log_error("POST /connection_token", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   location_id = params[:location] || params['location_id']
   log_connect_context("POST /connection_token", stripe_account_id, "Step: creating connection token" + (location_id && !location_id.to_s.strip.empty? ? " (location=#{location_id})" : ""))
 
@@ -282,7 +282,7 @@ post '/create_payment_intent' do
     return log_error("POST /create_payment_intent", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   use_direct_charge = stripe_account_id && !stripe_account_id.strip.empty?
   log_connect_context("POST /create_payment_intent", stripe_account_id, "direct_charge=#{use_direct_charge} | Step: creating PaymentIntent (settlement on connected account when present)")
 
@@ -344,7 +344,7 @@ end
 # Optional: stripe_account_id - required when the PaymentIntent was created on a connected account (direct charge).
 post '/capture_payment_intent' do
   id = params["payment_intent_id"]
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /capture_payment_intent", stripe_account_id, "Step: capturing payment_intent_id=#{id}")
 
   begin
@@ -372,7 +372,7 @@ end
 # Optional: stripe_account_id - required when the PaymentIntent was created on a connected account (direct charge).
 post '/cancel_payment_intent' do
   id = params["payment_intent_id"]
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /cancel_payment_intent", stripe_account_id, "Step: canceling payment_intent_id=#{id}")
 
   begin
@@ -400,7 +400,7 @@ post '/create_setup_intent' do
     return log_error("POST /create_setup_intent", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /create_setup_intent", stripe_account_id, "Step: creating SetupIntent")
 
   begin
@@ -420,7 +420,7 @@ post '/create_setup_intent' do
       setup_intent_params[:on_behalf_of] = params[:on_behalf_of]
     end
 
-    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
     request_opts = {}
     request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
 
@@ -493,14 +493,14 @@ post '/update_payment_intent' do
     return log_error("POST /update_payment_intent", "'payment_intent_id' is a required parameter")
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /update_payment_intent", stripe_account_id, "Step: updating payment_intent_id=#{payment_intent_id}")
 
   begin
     allowed_keys = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
 
-    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
     request_opts = {}
     request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
 
@@ -534,7 +534,7 @@ get '/list_locations' do
     return log_error("GET /list_locations", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("GET /list_locations", stripe_account_id, "Step: listing locations")
 
   begin
@@ -567,7 +567,7 @@ post '/create_location' do
     return log_error("POST /create_location", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id']
+  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   log_connect_context("POST /create_location", stripe_account_id, "Step: creating location")
 
   begin
