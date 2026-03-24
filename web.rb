@@ -30,6 +30,13 @@ else
 end
 Stripe.api_version = '2020-03-02'
 
+# This backend uses only this Stripe Connect account (direct charges). No platform-account Terminal or payments.
+CONNECTED_ACCOUNT_ID = 'acct_1T5aDBBfHXwLiSAu'.freeze
+
+def connected_account_request_opts
+  { stripe_account: CONNECTED_ACCOUNT_ID }
+end
+
 # Production Configuration Validation
 if PRODUCTION
   if Stripe.api_key.nil? || Stripe.api_key.empty? || !Stripe.api_key.start_with?('sk_live')
@@ -72,11 +79,9 @@ def log_info(message)
   return message
 end
 
-# Log whether request is for connected account or platform, and optional step description.
-def log_connect_context(endpoint, stripe_account_id, step = nil)
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  msg = "[#{endpoint}] connected_account=#{connected ? 'yes' : 'no'}"
-  msg += " (stripe_account_id=#{stripe_account_id.strip})" if connected && stripe_account_id
+# Log connected-account context and optional step description.
+def log_connect_context(endpoint, step = nil)
+  msg = "[#{endpoint}] stripe_account_id=#{CONNECTED_ACCOUNT_ID}"
   msg += " | #{step}" if step
   log_info(msg)
 end
@@ -120,9 +125,8 @@ def validateApiKey
   return nil
 end
 
-# This endpoint registers a Verifone P400 reader to your Stripe account.
+# This endpoint registers a Verifone P400 reader on the connected account.
 # https://stripe.com/docs/terminal/readers/connecting/verifone-p400#register-reader
-# Optional: stripe_account_id - register the reader on this connected account (direct charges).
 post '/register_reader' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -130,26 +134,21 @@ post '/register_reader' do
     return log_error("POST /register_reader", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /register_reader", stripe_account_id, "Step: registering reader")
+  log_connect_context("POST /register_reader", "Step: registering reader")
 
   begin
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-
     reader_params = {
       :registration_code => params[:registration_code],
       :label => params[:label],
       :location => params[:location]
     }
-    reader = Stripe::Terminal::Reader.create(reader_params, request_opts)
+    reader = Stripe::Terminal::Reader.create(reader_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /register_reader", "Failed to register reader", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /register_reader] Success: reader_id=#{reader.id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /register_reader] Success: reader_id=#{reader.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   # Note that returning the Stripe reader object directly creates a dependency between your
   # backend's Stripe.api_version and your clients, making future upgrades more complicated.
@@ -158,14 +157,11 @@ post '/register_reader' do
   return reader.to_json
 end
 
-# This endpoint creates a ConnectionToken, which gives the SDK permission
-# to use a reader with your Stripe account.
+# This endpoint creates a ConnectionToken for the connected account Terminal.
 # https://stripe.com/docs/terminal/sdk/js#connection-token
 # https://stripe.com/docs/terminal/features/connect#direct-connection-tokens
 #
-# Optional params:
-#   stripe_account_id - Create token for this connected account (direct charges).
-#   location          - Scope token to this Terminal location (readers at this location only).
+# Optional: location / location_id — scope token to this Terminal location.
 post '/connection_token' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -173,65 +169,29 @@ post '/connection_token' do
     return log_error("POST /connection_token", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
   location_id = params[:location] || params['location_id']
-  log_connect_context("POST /connection_token", stripe_account_id, "Step: creating connection token" + (location_id && !location_id.to_s.strip.empty? ? " (location=#{location_id})" : ""))
+  log_connect_context("POST /connection_token", "Step: creating connection token" + (location_id && !location_id.to_s.strip.empty? ? " (location=#{location_id})" : ""))
 
   begin
     token_params = {}
     token_params[:location] = location_id.strip if location_id && !location_id.to_s.strip.empty?
 
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.strip.empty?
-
-    if request_opts.empty?
-      token = Stripe::Terminal::ConnectionToken.create(token_params)
-      log_info("[POST /connection_token] Step: created token on platform")
-    else
-      log_info("[POST /connection_token] Step: creating token for connected account #{stripe_account_id}")
-      token = Stripe::Terminal::ConnectionToken.create(token_params, request_opts)
-    end
+    token = Stripe::Terminal::ConnectionToken.create(token_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /connection_token", "Failed to create ConnectionToken", e)
   end
 
-  log_info("[POST /connection_token] Success: connected_account=#{request_opts.empty? ? 'no' : 'yes'}")
+  log_info("[POST /connection_token] Success: stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   content_type :json
   status 200
   return {:secret => token.secret}.to_json
 end
 
-# This endpoint creates a PaymentIntent.
-# https://stripe.com/docs/terminal/payments#create
-# https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
-#
-# Connected accounts:
-#   stripe_account_id - When set, create customer on connected account and create PaymentIntent on connected account (direct charge).
-#   Settlement merchant will be the connected account (no transfer). If no customer/email, we create a customer on connected account first.
-#   customer_name or name - Optional. Display name for the customer in Stripe dashboard (e.g. "Gsgss"); avoids showing "walk-in@terminal.local".
-# Looks up or creates a Customer on your stripe account with the provided email (platform only).
-def lookupOrCreateCustomer(customerEmail)
-  return nil if customerEmail.nil? || customerEmail.empty?
-  
-  begin
-    customerList = Stripe::Customer.list(email: customerEmail, limit: 1).data
-    if (customerList.length == 1)
-      return customerList[0]
-    else
-      return Stripe::Customer.create(email: customerEmail)
-    end
-  rescue Stripe::StripeError => e
-    log_error("lookupOrCreateCustomer", "Creating or retrieving customer", e)
-    return nil
-  end
-end
-
-# Look up or create a Customer on the connected account. Used so the PaymentIntent is created on the connected account
-# with a customer (settlement merchant = connected account). Returns the customer id on the connected account.
-# customer_name (optional): display name for the customer in Stripe dashboard (e.g. "Gsgss"); use params customer_name or name.
-def lookupOrCreateCustomerOnConnectedAccount(customerEmail, stripe_account_id, customer_name = nil)
-  request_opts = { stripe_account: stripe_account_id.strip }
+# Look up or create a Customer on the connected account for Terminal payments. Returns the customer id.
+# customer_name — optional display name; without email a walk-in customer is created.
+def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
+  request_opts = connected_account_request_opts
   email = customerEmail.to_s.strip
   email = nil if email.empty?
   name = customer_name.to_s.strip
@@ -272,6 +232,11 @@ def lookupOrCreateCustomerOnConnectedAccount(customerEmail, stripe_account_id, c
   end
 end
 
+# Creates a PaymentIntent on the connected account (Stripe-Connect direct charge).
+# Uses request option stripe_account only — no transfer_data, no separate charges and transfers.
+# Funds settle on the connected account; transfer capability on the connected account is not required for this flow.
+# https://stripe.com/docs/terminal/payments#create
+# https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
 post '/create_payment_intent' do
   # Log all received data from the triggering call
   log_info("=== create_payment_intent triggered ===\nFull received params: #{params.inspect}\nRaw request body: #{request.body.read rescue 'N/A'}\nLocation ID: #{params[:location_id] || params['location_id'] || 'not provided'}\nOrder ID: #{params[:order_id] || params['order_id'] || 'not provided'}\nTags: #{params[:tags] || params['tags'] || 'not provided'}\nAll param keys: #{params.keys.inspect}")
@@ -282,9 +247,7 @@ post '/create_payment_intent' do
     return log_error("POST /create_payment_intent", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  use_direct_charge = stripe_account_id && !stripe_account_id.strip.empty?
-  log_connect_context("POST /create_payment_intent", stripe_account_id, "direct_charge=#{use_direct_charge} | Step: creating PaymentIntent (settlement on connected account when present)")
+  log_connect_context("POST /create_payment_intent", "Step: creating PaymentIntent on connected account")
 
   begin
     customer_email = params[:email] || params[:receipt_email]
@@ -299,57 +262,42 @@ post '/create_payment_intent' do
       :receipt_email => customer_email,
     }
 
-    request_opts = {}
-    if use_direct_charge
-      # Direct charge: create customer on connected account (clone/lookup or create), then create PI on connected account.
-      # No transfer — settlement merchant will be the connected account.
-      request_opts[:stripe_account] = stripe_account_id.strip
-      connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, stripe_account_id, customer_name)
-      payment_intent_params[:customer] = connected_customer_id
-      log_info("[POST /create_payment_intent] Step: created/lookup customer on connected account (#{connected_customer_id}), creating PaymentIntent on connected account")
-      log_info("[POST /create_payment_intent] IMPORTANT: For the reader to complete this payment, your app MUST request the connection token with the SAME stripe_account_id (call POST /connection_token with stripe_account_id=#{stripe_account_id}). Reader and PaymentIntent must be on the same account.")
-    else
-      # Platform: optional customer on platform
-      customer = nil
-      customer = lookupOrCreateCustomer(customer_email) if customer_email
-      payment_intent_params[:customer] = customer.id if customer
-    end
+    request_opts = connected_account_request_opts
+    connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+    payment_intent_params[:customer] = connected_customer_id
+    log_info("[POST /create_payment_intent] Step: customer #{connected_customer_id} on #{CONNECTED_ACCOUNT_ID}; creating PaymentIntent")
     
     if params[:metadata] && !params[:metadata].empty?
       payment_intent_params[:metadata] = params[:metadata]
     end
-    
-    payment_intent = Stripe::PaymentIntent.create(payment_intent_params, request_opts.empty? ? {} : request_opts)
+
+    # Direct charge: PI belongs to CONNECTED_ACCOUNT_ID (second arg). No platform transfer.
+    payment_intent = Stripe::PaymentIntent.create(payment_intent_params, request_opts)
     
     # Update description to only contain the PaymentIntent ID
-    update_opts = request_opts.empty? ? {} : request_opts
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent.id,
       { description: payment_intent.id },
-      update_opts
+      request_opts
     )
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_payment_intent", "Failed to create PaymentIntent", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /create_payment_intent] Success: payment_intent_id=#{payment_intent.id} | connected_account=#{connected ? 'yes' : 'no'} | settlement_merchant=#{use_direct_charge ? 'connected_account' : 'platform'}")
+  log_info("[POST /create_payment_intent] Success: payment_intent_id=#{payment_intent.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# This endpoint captures a PaymentIntent.
+# This endpoint captures a PaymentIntent on the connected account.
 # https://stripe.com/docs/terminal/payments#capture
-# Optional: stripe_account_id - required when the PaymentIntent was created on a connected account (direct charge).
 post '/capture_payment_intent' do
   id = params["payment_intent_id"]
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /capture_payment_intent", stripe_account_id, "Step: capturing payment_intent_id=#{id}")
+  log_connect_context("POST /capture_payment_intent", "Step: capturing payment_intent_id=#{id}")
 
   begin
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
+    request_opts = connected_account_request_opts
 
     if !params["amount_to_capture"].nil?
       payment_intent = Stripe::PaymentIntent.capture(id, { amount_to_capture: params["amount_to_capture"] }, request_opts)
@@ -361,38 +309,31 @@ post '/capture_payment_intent' do
     return log_error("POST /capture_payment_intent", "Failed to capture PaymentIntent", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /capture_payment_intent] Success: payment_intent_id=#{id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /capture_payment_intent] Success: payment_intent_id=#{id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# This endpoint cancels a PaymentIntent.
+# This endpoint cancels a PaymentIntent on the connected account.
 # https://stripe.com/docs/api/payment_intents/cancel
-# Optional: stripe_account_id - required when the PaymentIntent was created on a connected account (direct charge).
 post '/cancel_payment_intent' do
   id = params["payment_intent_id"]
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /cancel_payment_intent", stripe_account_id, "Step: canceling payment_intent_id=#{id}")
+  log_connect_context("POST /cancel_payment_intent", "Step: canceling payment_intent_id=#{id}")
 
   begin
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-    payment_intent = Stripe::PaymentIntent.cancel(id, {}, request_opts)
+    payment_intent = Stripe::PaymentIntent.cancel(id, {}, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /cancel_payment_intent", "Failed to cancel PaymentIntent", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /cancel_payment_intent] Success: payment_intent_id=#{id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /cancel_payment_intent] Success: payment_intent_id=#{id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# This endpoint creates a SetupIntent.
+# This endpoint creates a SetupIntent on the connected account.
 # https://stripe.com/docs/api/setup_intents/create
-# Optional: stripe_account_id - create the SetupIntent on this connected account (direct charges).
 post '/create_setup_intent' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -400,8 +341,7 @@ post '/create_setup_intent' do
     return log_error("POST /create_setup_intent", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /create_setup_intent", stripe_account_id, "Step: creating SetupIntent")
+  log_connect_context("POST /create_setup_intent", "Step: creating SetupIntent")
 
   begin
     setup_intent_params = {
@@ -420,58 +360,55 @@ post '/create_setup_intent' do
       setup_intent_params[:on_behalf_of] = params[:on_behalf_of]
     end
 
-    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-
-    setup_intent = Stripe::SetupIntent.create(setup_intent_params, request_opts)
+    setup_intent = Stripe::SetupIntent.create(setup_intent_params, connected_account_request_opts)
 
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_setup_intent", "Failed to create SetupIntent", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /create_setup_intent] Success: setup_intent_id=#{setup_intent.id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /create_setup_intent] Success: setup_intent_id=#{setup_intent.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => setup_intent.id, :secret => setup_intent.client_secret}.to_json
 end
 
-# Looks up or creates a Customer on your stripe account
-# with email "example@test.com".
-def lookupOrCreateExampleCustomer
+# Looks up or creates example@test.com Customer on the connected account (saved-card demo).
+def lookupOrCreateExampleCustomerOnConnectedAccount
   customerEmail = "example@test.com"
+  request_opts = connected_account_request_opts
   begin
-    customerList = Stripe::Customer.list(email: customerEmail, limit: 1).data
+    customerList = Stripe::Customer.list({ email: customerEmail, limit: 1 }, request_opts).data
     if (customerList.length == 1)
       return customerList[0]
     else
-      return Stripe::Customer.create(email: customerEmail)
+      return Stripe::Customer.create({ email: customerEmail }, request_opts)
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_error("lookupOrCreateExampleCustomer", "Creating or retrieving example customer", e)
+    return log_error("lookupOrCreateExampleCustomerOnConnectedAccount", "Creating or retrieving example customer", e)
   end
 end
 
-# This endpoint attaches a PaymentMethod to a Customer.
+# This endpoint attaches a PaymentMethod to a Customer on the connected account.
 # https://stripe.com/docs/terminal/payments/saving-cards#read-reusable-card
 post '/attach_payment_method_to_customer' do
   begin
-    customer = lookupOrCreateExampleCustomer
+    customer = lookupOrCreateExampleCustomerOnConnectedAccount
 
     payment_method = Stripe::PaymentMethod.attach(
       params[:payment_method_id],
       {
         customer: customer.id,
         expand: ["customer"],
-    })
+      },
+      connected_account_request_opts
+    )
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /attach_payment_method_to_customer", "Failed to attach PaymentMethod to Customer", e)
   end
 
-  log_info("[POST /attach_payment_method_to_customer] Success: customer_id=#{customer.id} (platform)")
+  log_info("[POST /attach_payment_method_to_customer] Success: customer_id=#{customer.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
 
   status 200
   # Note that returning the Stripe payment_method object directly creates a dependency between your
@@ -481,10 +418,7 @@ post '/attach_payment_method_to_customer' do
   return payment_method.to_json
 end
 
-# This endpoint updates the PaymentIntent represented by 'payment_intent_id'.
-# It currently only supports updating the 'receipt_email' property.
-# Optional: stripe_account_id - required when the PaymentIntent was created on a connected account (direct charge).
-#
+# This endpoint updates the PaymentIntent on the connected account (e.g. receipt_email).
 # https://stripe.com/docs/api/payment_intents/update
 post '/update_payment_intent' do
   payment_intent_id = params["payment_intent_id"]
@@ -493,21 +427,16 @@ post '/update_payment_intent' do
     return log_error("POST /update_payment_intent", "'payment_intent_id' is a required parameter")
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /update_payment_intent", stripe_account_id, "Step: updating payment_intent_id=#{payment_intent_id}")
+  log_connect_context("POST /update_payment_intent", "Step: updating payment_intent_id=#{payment_intent_id}")
 
   begin
     allowed_keys = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
 
-    stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent_id,
       update_params,
-      request_opts
+      connected_account_request_opts
     )
 
     log_info("Updated PaymentIntent #{payment_intent_id}")
@@ -516,16 +445,12 @@ post '/update_payment_intent' do
     return log_error("POST /update_payment_intent", "Failed to update PaymentIntent", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /update_payment_intent] Success: payment_intent_id=#{payment_intent_id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /update_payment_intent] Success: payment_intent_id=#{payment_intent_id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# This endpoint lists the first 100 Locations. If you will have more than 100
-# Locations, you'll likely want to implement pagination in your application so that
-# you can efficiently fetch Locations as needed.
-# Optional: stripe_account_id - list locations for this connected account (direct charges).
+# Lists the first 100 Terminal locations on the connected account.
 # https://stripe.com/docs/api/terminal/locations
 get '/list_locations' do
   validationError = validateApiKey
@@ -534,32 +459,26 @@ get '/list_locations' do
     return log_error("GET /list_locations", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("GET /list_locations", stripe_account_id, "Step: listing locations")
+  log_connect_context("GET /list_locations", "Step: listing locations")
 
   begin
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-
     locations = Stripe::Terminal::Location.list(
       { limit: 100 },
-      request_opts
+      connected_account_request_opts
     )
   rescue Stripe::StripeError => e
     status 402
     return log_error("GET /list_locations", "Failed to fetch Locations", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[GET /list_locations] Success: count=#{locations.data.size} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[GET /list_locations] Success: count=#{locations.data.size} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   content_type :json
   return locations.data.to_json
 end
 
-# This endpoint creates a Location.
+# Creates a Terminal location on the connected account.
 # https://stripe.com/docs/api/terminal/locations
-# Optional: stripe_account_id - create the location on this connected account (direct charges).
 post '/create_location' do
   validationError = validateApiKey
   if !validationError.nil?
@@ -567,25 +486,20 @@ post '/create_location' do
     return log_error("POST /create_location", validationError)
   end
 
-  stripe_account_id = params[:stripe_account_id] || params['stripe_account_id'] || 'acct_1T6RlzBIELhMHljL'
-  log_connect_context("POST /create_location", stripe_account_id, "Step: creating location")
+  log_connect_context("POST /create_location", "Step: creating location")
 
   begin
-    request_opts = {}
-    request_opts[:stripe_account] = stripe_account_id.strip if stripe_account_id && !stripe_account_id.to_s.strip.empty?
-
     location_params = {
       display_name: params[:display_name],
       address: params[:address]
     }
-    location = Stripe::Terminal::Location.create(location_params, request_opts)
+    location = Stripe::Terminal::Location.create(location_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_location", "Failed to create Location", e)
   end
 
-  connected = stripe_account_id && !stripe_account_id.to_s.strip.empty?
-  log_info("[POST /create_location] Success: location_id=#{location.id} | connected_account=#{connected ? 'yes' : 'no'}")
+  log_info("[POST /create_location] Success: location_id=#{location.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   content_type :json
   return location.to_json
