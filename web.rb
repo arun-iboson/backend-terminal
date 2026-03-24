@@ -28,10 +28,15 @@ if STRIPE_ENV == 'production'
 else
   Stripe.api_key = ENV['STRIPE_TEST_SECRET_KEY']
 end
-Stripe.api_version = '2020-03-02'
+Stripe.api_version = '2023-10-16'
 
-# This backend uses only this Stripe Connect account (direct charges). No platform-account Terminal or payments.
-CONNECTED_ACCOUNT_ID = 'acct_1T6RlzBIELhMHljL'.freeze
+# The Stripe Connect account this backend operates on behalf of (direct charges).
+# Set STRIPE_CONNECTED_ACCOUNT_ID in your environment / .env file.
+CONNECTED_ACCOUNT_ID = (ENV['STRIPE_CONNECTED_ACCOUNT_ID'] || 'acct_1T5aDBBfHXwLiSAu').freeze
+
+if CONNECTED_ACCOUNT_ID.nil? || CONNECTED_ACCOUNT_ID.strip.empty?
+  raise "FATAL: STRIPE_CONNECTED_ACCOUNT_ID environment variable is not set."
+end
 
 def connected_account_request_opts
   { stripe_account: CONNECTED_ACCOUNT_ID }
@@ -98,6 +103,17 @@ get '/' do
   status 404
   content_type :json
   {:error => 'Not Found', :message => 'This service is not available.'}.to_json
+end
+
+get '/health' do
+  status 200
+  content_type :json
+  {
+    :status => 'ok',
+    :stripe_env => STRIPE_ENV,
+    :api_version => Stripe.api_version,
+    :connected_account => CONNECTED_ACCOUNT_ID,
+  }.to_json
 end
 
 def validateApiKey
@@ -258,9 +274,17 @@ post '/create_payment_intent' do
       :amount => params[:amount],
       :currency => params[:currency] || 'usd',
       :description => params[:description] || 'Example PaymentIntent',
-      :payment_method_options => params[:payment_method_options] || [],
+      :payment_method_options => params[:payment_method_options] || {},
       :receipt_email => customer_email,
     }
+
+    # When this payment is the first charge of a subscription/recurring plan,
+    # instruct Stripe to save the card_present PaymentMethod for future off-session use.
+    # Native Stripe::Subscription does NOT support card_present; recurring charges must
+    # be made as manual off-session PaymentIntents using the saved PaymentMethod ID.
+    if params[:setup_future_usage] == 'off_session'
+      payment_intent_params[:setup_future_usage] = 'off_session'
+    end
 
     request_opts = connected_account_request_opts
     connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
@@ -391,16 +415,33 @@ end
 
 # This endpoint attaches a PaymentMethod to a Customer on the connected account.
 # https://stripe.com/docs/terminal/payments/saving-cards#read-reusable-card
+#
+# Required params:
+#   payment_method_id — the PaymentMethod ID to attach (pm_...)
+# Optional params:
+#   customer_id       — attach to this specific customer (cus_...)
+#   email             — if no customer_id, look up or create customer by email
 post '/attach_payment_method_to_customer' do
+  payment_method_id = params[:payment_method_id]
+  if payment_method_id.nil? || payment_method_id.to_s.strip.empty?
+    status 400
+    return log_error("POST /attach_payment_method_to_customer", "'payment_method_id' is required")
+  end
+
   begin
-    customer = lookupOrCreateExampleCustomerOnConnectedAccount
+    customer_id = params[:customer_id]
+    if customer_id && !customer_id.to_s.strip.empty?
+      customer_id = customer_id.strip
+      log_info("[POST /attach_payment_method_to_customer] Using provided customer_id=#{customer_id}")
+    else
+      customer_email = params[:email] || params[:receipt_email]
+      customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email)
+      log_info("[POST /attach_payment_method_to_customer] Resolved customer_id=#{customer_id} from email")
+    end
 
     payment_method = Stripe::PaymentMethod.attach(
-      params[:payment_method_id],
-      {
-        customer: customer.id,
-        expand: ["customer"],
-      },
+      payment_method_id,
+      { customer: customer_id },
       connected_account_request_opts
     )
   rescue Stripe::StripeError => e
@@ -408,14 +449,11 @@ post '/attach_payment_method_to_customer' do
     return log_error("POST /attach_payment_method_to_customer", "Failed to attach PaymentMethod to Customer", e)
   end
 
-  log_info("[POST /attach_payment_method_to_customer] Success: customer_id=#{customer.id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
+  log_info("[POST /attach_payment_method_to_customer] Success: pm_id=#{payment_method_id} | customer_id=#{customer_id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
 
   status 200
-  # Note that returning the Stripe payment_method object directly creates a dependency between your
-  # backend's Stripe.api_version and your clients, making future upgrades more complicated.
-  # All clients must also be ready for backwards-compatible changes at any time:
-  # https://stripe.com/docs/upgrades#what-changes-does-stripe-consider-to-be-backwards-compatible
-  return payment_method.to_json
+  content_type :json
+  return { :payment_method => payment_method.id, :customer => customer_id }.to_json
 end
 
 # This endpoint updates the PaymentIntent on the connected account (e.g. receipt_email).
@@ -448,6 +486,80 @@ post '/update_payment_intent' do
   log_info("[POST /update_payment_intent] Success: payment_intent_id=#{payment_intent_id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
   status 200
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
+end
+
+# Creates an off-session recurring charge using a previously saved card_present PaymentMethod.
+# Use this instead of Stripe::Subscription for Terminal tap-to-pay / card_present recurring billing.
+# Stripe Subscriptions only support the `card` type; card_present must use manual off-session PIs.
+#
+# Required params:
+#   payment_method_id — the saved card_present PaymentMethod ID (pm_...)
+#   customer_id       — the Stripe Customer ID (cus_...)
+#   amount            — charge amount in cents
+# Optional params:
+#   currency          — defaults to 'usd'
+#   description       — human-readable label for the charge
+#   receipt_email     — email for the Stripe receipt
+#   metadata          — hash of key/value pairs (e.g. order_id, subscription_id)
+post '/create_recurring_payment' do
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("POST /create_recurring_payment", validationError)
+  end
+
+  payment_method_id = params[:payment_method_id]
+  customer_id       = params[:customer_id]
+  amount            = params[:amount]
+
+  if payment_method_id.nil? || payment_method_id.strip.empty?
+    status 400
+    return log_error("POST /create_recurring_payment", "'payment_method_id' is required")
+  end
+  if customer_id.nil? || customer_id.strip.empty?
+    status 400
+    return log_error("POST /create_recurring_payment", "'customer_id' is required")
+  end
+  if amount.nil? || amount.to_s.strip.empty?
+    status 400
+    return log_error("POST /create_recurring_payment", "'amount' is required")
+  end
+
+  log_connect_context("POST /create_recurring_payment", "Step: creating off-session PaymentIntent for saved card_present")
+
+  begin
+    request_opts = connected_account_request_opts
+
+    pi_params = {
+      :amount               => amount.to_i,
+      :currency             => params[:currency] || 'usd',
+      :customer             => customer_id,
+      :payment_method       => payment_method_id,
+      :payment_method_types => ['card_present'],
+      :confirm              => true,
+      :off_session          => true,
+      :capture_method       => 'automatic',
+    }
+
+    pi_params[:description]    = params[:description]   if params[:description]   && !params[:description].to_s.strip.empty?
+    pi_params[:receipt_email]  = params[:receipt_email] if params[:receipt_email] && !params[:receipt_email].to_s.strip.empty?
+    pi_params[:metadata]       = params[:metadata]      if params[:metadata]      && !params[:metadata].empty?
+
+    payment_intent = Stripe::PaymentIntent.create(pi_params, request_opts)
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("POST /create_recurring_payment", "Failed to create off-session recurring PaymentIntent", e)
+  end
+
+  log_info("[POST /create_recurring_payment] Success: payment_intent_id=#{payment_intent.id} | customer_id=#{customer_id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
+  status 200
+  content_type :json
+  return {
+    :intent => payment_intent.id,
+    :status => payment_intent.status,
+    :amount => payment_intent.amount,
+    :currency => payment_intent.currency,
+  }.to_json
 end
 
 # Lists the first 100 Terminal locations on the connected account.
