@@ -31,7 +31,7 @@ end
 Stripe.api_version = '2020-03-02'
 
 # This backend uses only this Stripe Connect account (direct charges). No platform-account Terminal or payments.
-CONNECTED_ACCOUNT_ID = 'acct_1T5aDBBfHXwLiSAu'.freeze
+CONNECTED_ACCOUNT_ID = 'acct_1T6RlzBIELhMHljL'.freeze
 
 def connected_account_request_opts
   { stripe_account: CONNECTED_ACCOUNT_ID }
