@@ -42,27 +42,6 @@ def connected_account_request_opts
   { stripe_account: CONNECTED_ACCOUNT_ID }
 end
 
-# Nested metadata from create_payment_intent (form-encoded metadata[key]=value).
-def payment_intent_metadata_hash(params)
-  m = params[:metadata] || params['metadata']
-  return {} unless m.is_a?(Hash)
-  m
-end
-
-# First non-empty value for any key variant (string/symbol).
-def meta_pick(meta, *key_names)
-  key_names.flatten.each do |name|
-    [name.to_s, name.to_sym].each do |k|
-      next unless meta.key?(k)
-      v = meta[k]
-      next if v.nil?
-      s = v.to_s.strip
-      return v if !s.empty?
-    end
-  end
-  nil
-end
-
 # Production Configuration Validation
 if PRODUCTION
   if Stripe.api_key.nil? || Stripe.api_key.empty? || !Stripe.api_key.start_with?('sk_live')
@@ -112,72 +91,12 @@ def log_connect_context(endpoint, step = nil)
   log_info(msg)
 end
 
-# Normalize nested objects for logs (hashes, Stripe objects).
-def inspect_for_stripe_log(obj)
-  case obj
-  when Hash
-    obj.transform_values { |v| inspect_for_stripe_log(v) }
-  when Array
-    obj.map { |v| inspect_for_stripe_log(v) }
-  when Stripe::StripeObject
-    (obj.to_hash rescue nil) || obj.inspect
-  else
-    obj
-  end
-end
-
-# Log outbound Stripe API arguments (no platform secret key — only call bodies + stripe_account).
-def log_stripe_request(http_endpoint_label, stripe_operation, params_for_stripe, request_opts = nil)
-  opts = request_opts ? inspect_for_stripe_log(request_opts) : nil
-  body = inspect_for_stripe_log(params_for_stripe)
-  log_info("[STRIPE → #{http_endpoint_label}] #{stripe_operation}\nrequest_opts=#{opts.inspect}\nparams=#{body.inspect}")
-end
-
-# Log PaymentIntent fields after create/update (client_secret truncated).
-def log_payment_intent_stripe_response(http_endpoint_label, step, pi)
-  return unless pi
-  sec = pi.respond_to?(:client_secret) && pi.client_secret ? "#{pi.client_secret[0..12]}…REDACTED" : nil
-  log_info(
-    "[STRIPE ← #{http_endpoint_label}] #{step}\n" \
-    "id=#{pi.id} status=#{pi.status} amount=#{pi.amount} currency=#{pi.currency} " \
-    "customer=#{pi.customer} capture_method=#{pi.capture_method rescue 'n/a'} " \
-    "setup_future_usage=#{pi.setup_future_usage rescue 'n/a'} " \
-    "payment_method_types=#{(pi.payment_method_types rescue pi['payment_method_types']).inspect} " \
-    "latest_charge=#{pi.latest_charge rescue 'n/a'} client_secret=#{sec}"
-  )
-end
-
-CARD_PRESENT_SAVE_ERROR_HINT = <<~HINT.strip.freeze
-  [CAUSE: card_present vs subscription/customer]
-  Stripe rejects saving Terminal type `card_present` to Customers or as subscription default_payment_method.
-  Use the reusable `generated_card` PaymentMethod (type `card`, id pm_...) from the succeeded charge:
-  POST /retrieve_generated_card with payment_intent_id after capture. If this log is from another service
-  (e.g. node-postgres-api), fix that service to use generated_card_payment_method_id, not the reader's card_present pm_ id.
-HINT
-
-# Log error with endpoint name, full Stripe error payload when applicable, and subscription/card_present cause.
+# Log error with endpoint name and full exception details.
 def log_error(endpoint, message, exception = nil)
-  lines = ["[#{endpoint}] Error: #{message}"]
-  if exception
-    lines << "Exception: #{exception.class} - #{exception.message}"
-    if exception.is_a?(Stripe::StripeError)
-      lines << "stripe_code=#{exception.code}" if exception.respond_to?(:code) && exception.code
-      lines << "stripe_http_status=#{exception.http_status}" if exception.respond_to?(:http_status) && exception.http_status
-      lines << "stripe_request_id=#{exception.request_id}" if exception.respond_to?(:request_id) && exception.request_id
-      if exception.respond_to?(:json_body) && exception.json_body
-        lines << "stripe_json_body=#{exception.json_body.inspect}"
-      elsif exception.respond_to?(:http_body) && exception.http_body
-        lines << "stripe_http_body=#{exception.http_body.inspect}"
-      end
-      em = exception.message.to_s
-      if em.include?('card_present') && (em.include?('cannot be saved') || em.include?('saved to customers'))
-        lines << CARD_PRESENT_SAVE_ERROR_HINT
-      end
-    end
-  end
-  out = lines.join("\n")
-  log_info(out)
-  return out
+  full = "[#{endpoint}] Error: #{message}"
+  full += " | Exception: #{exception.class} - #{exception.message}" if exception
+  log_info(full)
+  return full
 end
 
 get '/' do
@@ -239,9 +158,7 @@ post '/register_reader' do
       :label => params[:label],
       :location => params[:location]
     }
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /register_reader', 'Terminal::Reader.create', reader_params, ropts)
-    reader = Stripe::Terminal::Reader.create(reader_params, ropts)
+    reader = Stripe::Terminal::Reader.create(reader_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /register_reader", "Failed to register reader", e)
@@ -275,9 +192,7 @@ post '/connection_token' do
     token_params = {}
     token_params[:location] = location_id.strip if location_id && !location_id.to_s.strip.empty?
 
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /connection_token', 'Terminal::ConnectionToken.create', token_params, ropts)
-    token = Stripe::Terminal::ConnectionToken.create(token_params, ropts)
+    token = Stripe::Terminal::ConnectionToken.create(token_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /connection_token", "Failed to create ConnectionToken", e)
@@ -299,15 +214,11 @@ def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
   name = nil if name.empty?
   begin
     if email
-      list_q = { email: email, limit: 1 }
-      log_stripe_request('lookupOrCreateCustomer', 'Customer.list', list_q, request_opts)
-      customerList = Stripe::Customer.list(list_q, request_opts).data
+      customerList = Stripe::Customer.list({ email: email, limit: 1 }, request_opts).data
       if customerList.length >= 1
         cid = customerList[0].id
         if name
-          upd = { name: name }
-          log_stripe_request('lookupOrCreateCustomer', "Customer.update(#{cid})", upd, request_opts)
-          Stripe::Customer.update(cid, upd, request_opts)
+          Stripe::Customer.update(cid, { name: name }, request_opts)
           log_info("[lookupOrCreateCustomerOnConnectedAccount] Updated existing customer name on connected account: #{cid} (name=#{name})")
         else
           log_info("[lookupOrCreateCustomerOnConnectedAccount] Found existing customer on connected account: #{cid}")
@@ -316,7 +227,6 @@ def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
       end
       create_params = { email: email }
       create_params[:name] = name if name
-      log_stripe_request('lookupOrCreateCustomer', 'Customer.create', create_params, request_opts)
       newCustomer = Stripe::Customer.create(create_params, request_opts)
       log_info("[lookupOrCreateCustomerOnConnectedAccount] Created new customer on connected account: #{newCustomer.id} (email=#{email}#{name ? ", name=#{name}" : ''})")
       return newCustomer.id
@@ -328,7 +238,6 @@ def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
       else
         create_params[:email] = "walk-in@terminal.local"
       end
-      log_stripe_request('lookupOrCreateCustomer', 'Customer.create (walk-in)', create_params, request_opts)
       newCustomer = Stripe::Customer.create(create_params, request_opts)
       log_info("[lookupOrCreateCustomerOnConnectedAccount] Created walk-in customer on connected account: #{newCustomer.id}#{name ? " (name=#{name})" : ''}")
       return newCustomer.id
@@ -345,27 +254,8 @@ end
 # https://stripe.com/docs/terminal/payments#create
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
 post '/create_payment_intent' do
-  meta = payment_intent_metadata_hash(params)
-  loc_log = params[:location_id] || params['location_id'] || meta_pick(meta, :location_id)
-  ord_log = params[:order_id] || params['order_id'] || meta_pick(meta, :order_id)
-  wash_log = meta_pick(meta, :wash_type, 'wash_type')
-  mode_log = meta_pick(meta, :paymentMode, 'paymentMode')
-  cus_hint = meta_pick(meta, :stripe_customer_id, :stripe_customer, 'stripe_customer_id', 'stripe_customer')
-  email_log = params[:email] || params[:receipt_email] || meta_pick(meta, :customer_email, :email, 'customer_email', 'email')
-
   # Log all received data from the triggering call
-  log_info(
-    "=== create_payment_intent triggered ===\n" \
-    "Full received params: #{params.inspect}\n" \
-    "Raw request body: #{request.body.read rescue 'N/A'}\n" \
-    "Location ID (top-level or metadata): #{loc_log || 'not provided'}\n" \
-    "Order ID (top-level or metadata): #{ord_log || 'not provided'}\n" \
-    "wash_type (metadata): #{wash_log || 'not provided'} | paymentMode (metadata): #{mode_log || 'not provided'}\n" \
-    "Email / receipt (top-level or metadata): #{email_log || 'not provided'}\n" \
-    "stripe_customer_id hint (metadata): #{cus_hint || 'not provided'}\n" \
-    "Tags: #{params[:tags] || params['tags'] || 'not provided'}\n" \
-    "All param keys: #{params.keys.inspect}"
-  )
+  log_info("=== create_payment_intent triggered ===\nFull received params: #{params.inspect}\nRaw request body: #{request.body.read rescue 'N/A'}\nLocation ID: #{params[:location_id] || params['location_id'] || 'not provided'}\nOrder ID: #{params[:order_id] || params['order_id'] || 'not provided'}\nTags: #{params[:tags] || params['tags'] || 'not provided'}\nAll param keys: #{params.keys.inspect}")
 
   validationError = validateApiKey
   if !validationError.nil?
@@ -376,15 +266,8 @@ post '/create_payment_intent' do
   log_connect_context("POST /create_payment_intent", "Step: creating PaymentIntent on connected account")
 
   begin
-    existing_stripe_customer = meta_pick(meta, :stripe_customer_id, :stripe_customer, 'stripe_customer_id', 'stripe_customer')
-    existing_stripe_customer = existing_stripe_customer.to_s.strip if existing_stripe_customer
-    existing_stripe_customer = nil unless existing_stripe_customer&.start_with?('cus_')
-
-    customer_email = params[:email] || params[:receipt_email] ||
-      meta_pick(meta, :customer_email, :email, 'customer_email', 'email', 'receipt_email')
-    customer_name = params[:customer_name] || params[:name] || params['customer_name'] || params['name'] ||
-      meta_pick(meta, :customer_name, :name, 'customer_name', 'name')
-
+    customer_email = params[:email] || params[:receipt_email]
+    customer_name = params[:customer_name] || params[:name] || params['customer_name'] || params['name']
     payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
@@ -395,34 +278,16 @@ post '/create_payment_intent' do
       :receipt_email => customer_email,
     }
 
-    # Save the card_present PaymentMethod on the Customer for future off-session charges
-    # (subscriptions / recurring via /create_recurring_payment). Stripe requires
-    # setup_future_usage: 'off_session' for charges when the customer will not be present.
-    # Native Stripe::Subscription does NOT support card_present.
-    # Opt out for strictly one-time sales: pass one_time=true (or one_time=1 / yes).
-    one_time = %w[true 1 yes].include?(params[:one_time].to_s.downcase)
-    unless one_time
-      sfu = params[:setup_future_usage].to_s
-      if %w[on_session off_session].include?(sfu)
-        payment_intent_params[:setup_future_usage] = sfu
-      else
-        payment_intent_params[:setup_future_usage] = 'off_session'
-      end
+    # When this payment is the first charge of a subscription/recurring plan,
+    # instruct Stripe to save the card_present PaymentMethod for future off-session use.
+    # Native Stripe::Subscription does NOT support card_present; recurring charges must
+    # be made as manual off-session PaymentIntents using the saved PaymentMethod ID.
+    if params[:setup_future_usage] == 'off_session'
+      payment_intent_params[:setup_future_usage] = 'off_session'
     end
 
     request_opts = connected_account_request_opts
-    if existing_stripe_customer
-      connected_customer_id = existing_stripe_customer
-      log_info("[POST /create_payment_intent] Using Stripe Customer from metadata[stripe_customer_id]: #{connected_customer_id}")
-    else
-      connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
-      if wash_log && wash_log.to_s.downcase.include?('membership') && (customer_email.nil? || customer_email.to_s.strip.empty?)
-        log_info(
-          "[POST /create_payment_intent] WARN: wash_type suggests membership but no email/receipt_email (or metadata customer_email) — used walk-in customer #{connected_customer_id}. " \
-          "For subscriptions/saved cards, pass email or metadata[stripe_customer_id]=cus_... for the connected account."
-        )
-      end
-    end
+    connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
     payment_intent_params[:customer] = connected_customer_id
     log_info("[POST /create_payment_intent] Step: customer #{connected_customer_id} on #{CONNECTED_ACCOUNT_ID}; creating PaymentIntent")
     
@@ -431,19 +296,14 @@ post '/create_payment_intent' do
     end
 
     # Direct charge: PI belongs to CONNECTED_ACCOUNT_ID (second arg). No platform transfer.
-    log_stripe_request('POST /create_payment_intent', 'PaymentIntent.create', payment_intent_params, request_opts)
     payment_intent = Stripe::PaymentIntent.create(payment_intent_params, request_opts)
-    log_payment_intent_stripe_response('POST /create_payment_intent', 'PaymentIntent.create OK', payment_intent)
-
+    
     # Update description to only contain the PaymentIntent ID
-    desc_update = { description: payment_intent.id }
-    log_stripe_request('POST /create_payment_intent', "PaymentIntent.update(#{payment_intent.id})", desc_update, request_opts)
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent.id,
-      desc_update,
+      { description: payment_intent.id },
       request_opts
     )
-    log_payment_intent_stripe_response('POST /create_payment_intent', 'PaymentIntent.update OK', payment_intent)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_payment_intent", "Failed to create PaymentIntent", e)
@@ -464,14 +324,10 @@ post '/capture_payment_intent' do
     request_opts = connected_account_request_opts
 
     if !params["amount_to_capture"].nil?
-      cap_params = { amount_to_capture: params["amount_to_capture"] }
-      log_stripe_request('POST /capture_payment_intent', "PaymentIntent.capture(#{id})", cap_params, request_opts)
-      payment_intent = Stripe::PaymentIntent.capture(id, cap_params, request_opts)
+      payment_intent = Stripe::PaymentIntent.capture(id, { amount_to_capture: params["amount_to_capture"] }, request_opts)
     else
-      log_stripe_request('POST /capture_payment_intent', "PaymentIntent.capture(#{id})", {}, request_opts)
       payment_intent = Stripe::PaymentIntent.capture(id, {}, request_opts)
     end
-    log_payment_intent_stripe_response('POST /capture_payment_intent', 'PaymentIntent.capture OK', payment_intent)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /capture_payment_intent", "Failed to capture PaymentIntent", e)
@@ -482,92 +338,6 @@ post '/capture_payment_intent' do
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# Reusable pm_... (type card) created after an in-person payment when setup_future_usage was set.
-# Do NOT use the card_present PaymentMethod from the reader for Customer attach or Subscriptions.
-# https://docs.stripe.com/terminal/features/saving-payment-details/save-after-payment
-def generated_card_pm_id_from_charge(charge)
-  return nil unless charge
-  pmd = charge.payment_method_details
-  return nil unless pmd
-  cp = pmd.respond_to?(:card_present) ? pmd.card_present : nil
-  return nil unless cp
-  gc = cp.respond_to?(:generated_card) ? cp.generated_card : nil
-  return nil if gc.nil? || (gc.respond_to?(:empty?) && gc.empty?)
-  return gc if gc.is_a?(String) && gc.start_with?('pm_')
-  return gc.id if gc.respond_to?(:id) && gc.id.to_s.start_with?('pm_')
-  s = gc.to_s
-  s.start_with?('pm_') ? s : nil
-end
-
-# Returns the generated_card PaymentMethod id for subscriptions / default_payment_method.
-# Call after the Terminal payment succeeds (and after capture if using manual capture).
-#
-# Required: payment_intent_id (pi_...)
-#
-# Response includes generated_card_payment_method_id (pm_..., type card) when present.
-post '/retrieve_generated_card' do
-  validationError = validateApiKey
-  if !validationError.nil?
-    status 400
-    return log_error("POST /retrieve_generated_card", validationError)
-  end
-
-  payment_intent_id = params[:payment_intent_id] || params['payment_intent_id']
-  if payment_intent_id.nil? || payment_intent_id.to_s.strip.empty?
-    status 400
-    return log_error("POST /retrieve_generated_card", "'payment_intent_id' is required")
-  end
-
-  log_connect_context("POST /retrieve_generated_card", "Step: payment_intent_id=#{payment_intent_id}")
-
-  begin
-    request_opts = connected_account_request_opts
-    retrieve_q = { id: payment_intent_id.strip, expand: ['latest_charge'] }
-    log_stripe_request('POST /retrieve_generated_card', 'PaymentIntent.retrieve', retrieve_q, request_opts)
-    pi = Stripe::PaymentIntent.retrieve(retrieve_q, request_opts)
-    charge = pi.latest_charge
-    if charge.is_a?(String)
-      log_stripe_request('POST /retrieve_generated_card', "Charge.retrieve(#{charge})", {}, request_opts)
-      charge = Stripe::Charge.retrieve(charge, request_opts)
-    end
-    log_info(
-      "[STRIPE ← POST /retrieve_generated_card] after retrieve\n" \
-      "pi=#{pi.id} status=#{pi.status} latest_charge=#{charge&.id} " \
-      "charge_paid=#{charge&.paid} charge_status=#{charge&.status}"
-    )
-    pm_id = generated_card_pm_id_from_charge(charge)
-  rescue Stripe::StripeError => e
-    status 402
-    return log_error("POST /retrieve_generated_card", "Failed to retrieve PaymentIntent", e)
-  end
-
-  content_type :json
-  if pm_id.nil?
-    log_info(
-      "[POST /retrieve_generated_card] no_generated_card | pi=#{pi.id} status=#{pi.status} | " \
-      "Typical causes: one_time Terminal payment (no setup_future_usage), missing allow_redisplay on reader, " \
-      "wallet/unsupported card, or PI not yet succeeded/captured."
-    )
-    status 422
-    return {
-      :error => 'no_generated_card',
-      :message => 'No generated_card on this charge. Use setup_future_usage off_session on create_payment_intent, collect with allow_redisplay on the reader, complete/capture the payment, then retry. Wallets and some regional cards never produce a generated_card.',
-      :payment_intent_id => pi.id,
-      :payment_intent_status => pi.status,
-      :customer_id => pi.customer,
-    }.to_json
-  end
-
-  log_info("[POST /retrieve_generated_card] Success: pi=#{pi.id} generated_card=#{pm_id} | stripe_account_id=#{CONNECTED_ACCOUNT_ID}")
-  status 200
-  return {
-    :payment_intent_id => pi.id,
-    :payment_intent_status => pi.status,
-    :generated_card_payment_method_id => pm_id,
-    :customer_id => pi.customer,
-  }.to_json
-end
-
 # This endpoint cancels a PaymentIntent on the connected account.
 # https://stripe.com/docs/api/payment_intents/cancel
 post '/cancel_payment_intent' do
@@ -575,10 +345,7 @@ post '/cancel_payment_intent' do
   log_connect_context("POST /cancel_payment_intent", "Step: canceling payment_intent_id=#{id}")
 
   begin
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /cancel_payment_intent', "PaymentIntent.cancel(#{id})", {}, ropts)
-    payment_intent = Stripe::PaymentIntent.cancel(id, {}, ropts)
-    log_payment_intent_stripe_response('POST /cancel_payment_intent', 'PaymentIntent.cancel OK', payment_intent)
+    payment_intent = Stripe::PaymentIntent.cancel(id, {}, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /cancel_payment_intent", "Failed to cancel PaymentIntent", e)
@@ -617,14 +384,7 @@ post '/create_setup_intent' do
       setup_intent_params[:on_behalf_of] = params[:on_behalf_of]
     end
 
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /create_setup_intent', 'SetupIntent.create', setup_intent_params, ropts)
-    setup_intent = Stripe::SetupIntent.create(setup_intent_params, ropts)
-    log_info(
-      "[STRIPE ← POST /create_setup_intent] SetupIntent.create OK\n" \
-      "id=#{setup_intent.id} status=#{setup_intent.status} customer=#{setup_intent.customer} " \
-      "payment_method_types=#{setup_intent.payment_method_types.inspect}"
-    )
+    setup_intent = Stripe::SetupIntent.create(setup_intent_params, connected_account_request_opts)
 
   rescue Stripe::StripeError => e
     status 402
@@ -641,15 +401,11 @@ def lookupOrCreateExampleCustomerOnConnectedAccount
   customerEmail = "example@test.com"
   request_opts = connected_account_request_opts
   begin
-    list_q = { email: customerEmail, limit: 1 }
-    log_stripe_request('lookupOrCreateExampleCustomer', 'Customer.list', list_q, request_opts)
-    customerList = Stripe::Customer.list(list_q, request_opts).data
+    customerList = Stripe::Customer.list({ email: customerEmail, limit: 1 }, request_opts).data
     if (customerList.length == 1)
       return customerList[0]
     else
-      cp = { email: customerEmail }
-      log_stripe_request('lookupOrCreateExampleCustomer', 'Customer.create', cp, request_opts)
-      return Stripe::Customer.create(cp, request_opts)
+      return Stripe::Customer.create({ email: customerEmail }, request_opts)
     end
   rescue Stripe::StripeError => e
     status 402
@@ -658,11 +414,10 @@ def lookupOrCreateExampleCustomerOnConnectedAccount
 end
 
 # This endpoint attaches a PaymentMethod to a Customer on the connected account.
-# Only types such as generated_card (saved as type card) may be attached — not card_present.
-# https://docs.stripe.com/terminal/features/saving-payment-details/save-after-payment
+# https://stripe.com/docs/terminal/payments/saving-cards#read-reusable-card
 #
 # Required params:
-#   payment_method_id — reusable pm_... (e.g. from POST /retrieve_generated_card)
+#   payment_method_id — the PaymentMethod ID to attach (pm_...)
 # Optional params:
 #   customer_id       — attach to this specific customer (cus_...)
 #   email             — if no customer_id, look up or create customer by email
@@ -671,30 +426,6 @@ post '/attach_payment_method_to_customer' do
   if payment_method_id.nil? || payment_method_id.to_s.strip.empty?
     status 400
     return log_error("POST /attach_payment_method_to_customer", "'payment_method_id' is required")
-  end
-
-  begin
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /attach_payment_method_to_customer', "PaymentMethod.retrieve(#{payment_method_id.strip})", {}, ropts)
-    pm_check = Stripe::PaymentMethod.retrieve(payment_method_id.strip, ropts)
-    log_info(
-      "[STRIPE ← POST /attach_payment_method_to_customer] PaymentMethod.retrieve OK\n" \
-      "id=#{pm_check.id} type=#{pm_check.type} customer=#{pm_check.customer}"
-    )
-    if pm_check.type.to_s == 'card_present'
-      log_info(
-        "[POST /attach_payment_method_to_customer] REJECTED card_present pm=#{pm_check.id}\n#{CARD_PRESENT_SAVE_ERROR_HINT}"
-      )
-      status 400
-      content_type :json
-      return {
-        :error => 'card_present_not_attachable',
-        :message => "PaymentMethods of type 'card_present' cannot be saved to customers. After a successful Terminal payment with setup_future_usage, call POST /retrieve_generated_card with the PaymentIntent id and use generated_card_payment_method_id for subscriptions or attach.",
-      }.to_json
-    end
-  rescue Stripe::StripeError => e
-    status 402
-    return log_error("POST /attach_payment_method_to_customer", "Failed to verify PaymentMethod", e)
   end
 
   begin
@@ -708,16 +439,10 @@ post '/attach_payment_method_to_customer' do
       log_info("[POST /attach_payment_method_to_customer] Resolved customer_id=#{customer_id} from email")
     end
 
-    attach_body = { customer: customer_id }
-    log_stripe_request('POST /attach_payment_method_to_customer', "PaymentMethod.attach(#{payment_method_id})", attach_body, connected_account_request_opts)
     payment_method = Stripe::PaymentMethod.attach(
       payment_method_id,
-      attach_body,
+      { customer: customer_id },
       connected_account_request_opts
-    )
-    log_info(
-      "[STRIPE ← POST /attach_payment_method_to_customer] PaymentMethod.attach OK\n" \
-      "id=#{payment_method.id} type=#{payment_method.type} customer=#{payment_method.customer}"
     )
   rescue Stripe::StripeError => e
     status 402
@@ -745,14 +470,12 @@ post '/update_payment_intent' do
   begin
     allowed_keys = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /update_payment_intent', "PaymentIntent.update(#{payment_intent_id})", update_params, ropts)
+
     payment_intent = Stripe::PaymentIntent.update(
       payment_intent_id,
       update_params,
-      ropts
+      connected_account_request_opts
     )
-    log_payment_intent_stripe_response('POST /update_payment_intent', 'PaymentIntent.update OK', payment_intent)
 
     log_info("Updated PaymentIntent #{payment_intent_id}")
   rescue Stripe::StripeError => e
@@ -765,13 +488,12 @@ post '/update_payment_intent' do
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# Creates an off-session recurring charge using a previously saved generated_card PaymentMethod.
-# Use this instead of Stripe::Subscription for Terminal tap-to-pay recurring billing.
-# The initial in-person payment is card_present, but recurring re-use is card-not-present
-# using the generated_card PaymentMethod (type: card).
+# Creates an off-session recurring charge using a previously saved card_present PaymentMethod.
+# Use this instead of Stripe::Subscription for Terminal tap-to-pay / card_present recurring billing.
+# Stripe Subscriptions only support the `card` type; card_present must use manual off-session PIs.
 #
 # Required params:
-#   payment_method_id — the generated_card PaymentMethod ID (pm_..., type card)
+#   payment_method_id — the saved card_present PaymentMethod ID (pm_...)
 #   customer_id       — the Stripe Customer ID (cus_...)
 #   amount            — charge amount in cents
 # Optional params:
@@ -803,7 +525,7 @@ post '/create_recurring_payment' do
     return log_error("POST /create_recurring_payment", "'amount' is required")
   end
 
-  log_connect_context("POST /create_recurring_payment", "Step: creating off-session PaymentIntent for saved generated_card")
+  log_connect_context("POST /create_recurring_payment", "Step: creating off-session PaymentIntent for saved card_present")
 
   begin
     request_opts = connected_account_request_opts
@@ -813,7 +535,7 @@ post '/create_recurring_payment' do
       :currency             => params[:currency] || 'usd',
       :customer             => customer_id,
       :payment_method       => payment_method_id,
-      :payment_method_types => ['card'],
+      :payment_method_types => ['card_present'],
       :confirm              => true,
       :off_session          => true,
       :capture_method       => 'automatic',
@@ -823,9 +545,7 @@ post '/create_recurring_payment' do
     pi_params[:receipt_email]  = params[:receipt_email] if params[:receipt_email] && !params[:receipt_email].to_s.strip.empty?
     pi_params[:metadata]       = params[:metadata]      if params[:metadata]      && !params[:metadata].empty?
 
-    log_stripe_request('POST /create_recurring_payment', 'PaymentIntent.create (off_session recurring)', pi_params, request_opts)
     payment_intent = Stripe::PaymentIntent.create(pi_params, request_opts)
-    log_payment_intent_stripe_response('POST /create_recurring_payment', 'PaymentIntent.create OK', payment_intent)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_recurring_payment", "Failed to create off-session recurring PaymentIntent", e)
@@ -854,10 +574,10 @@ get '/list_locations' do
   log_connect_context("GET /list_locations", "Step: listing locations")
 
   begin
-    list_p = { limit: 100 }
-    ropts = connected_account_request_opts
-    log_stripe_request('GET /list_locations', 'Terminal::Location.list', list_p, ropts)
-    locations = Stripe::Terminal::Location.list(list_p, ropts)
+    locations = Stripe::Terminal::Location.list(
+      { limit: 100 },
+      connected_account_request_opts
+    )
   rescue Stripe::StripeError => e
     status 402
     return log_error("GET /list_locations", "Failed to fetch Locations", e)
@@ -885,9 +605,7 @@ post '/create_location' do
       display_name: params[:display_name],
       address: params[:address]
     }
-    ropts = connected_account_request_opts
-    log_stripe_request('POST /create_location', 'Terminal::Location.create', location_params, ropts)
-    location = Stripe::Terminal::Location.create(location_params, ropts)
+    location = Stripe::Terminal::Location.create(location_params, connected_account_request_opts)
   rescue Stripe::StripeError => e
     status 402
     return log_error("POST /create_location", "Failed to create Location", e)
