@@ -28,7 +28,7 @@ if STRIPE_ENV == 'production'
 else
   Stripe.api_key = ENV['STRIPE_TEST_SECRET_KEY']
 end
-Stripe.api_version = '2023-10-16'
+Stripe.api_version = '2024-09-30.acacia'
 
 # The Stripe Connect account this backend operates on behalf of (direct charges).
 # Set STRIPE_CONNECTED_ACCOUNT_ID in your environment / .env file.
@@ -771,12 +771,14 @@ post '/create_recurring_payment' do
   begin
     request_opts = connected_account_request_opts
 
+    # generated_card payment methods are of type 'card' (not 'card_present').
+    # card_present requires the physical card to be present and cannot be used off-session.
     pi_params = {
       :amount               => amount.to_i,
       :currency             => params[:currency] || 'usd',
       :customer             => customer_id,
       :payment_method       => payment_method_id,
-      :payment_method_types => ['card_present'],
+      :payment_method_types => ['card'],
       :confirm              => true,
       :off_session          => true,
       :capture_method       => 'automatic',
@@ -885,4 +887,542 @@ post '/create_location' do
   status 200
   content_type :json
   return location.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /create_payment_intent_for_subscription
+#
+# Creates a PaymentIntent specifically designed to save the card after an
+# in-person Tap to Pay payment for future subscription billing.
+#
+# Required params:
+#   amount        - charge amount in cents
+#   email         - customer email (used to look up / create a Stripe Customer)
+#
+# Optional params:
+#   currency      - default 'usd'
+#   customer_name - customer display name
+#   description   - payment description
+#
+# The PaymentIntent is created with:
+#   setup_future_usage: 'off_session'   → instructs Stripe to save the card
+#   capture_method: 'automatic'         → auto-captures (no manual capture step)
+#
+# After the Android SDK collects the payment method (with allowRedisplay='always')
+# and confirms the intent, call GET /get_payment_intent?payment_intent_id=pi_xxx
+# to retrieve the generated_card PM id for future subscription charges.
+# ─────────────────────────────────────────────────────────────────────────────
+
+post '/create_payment_intent_for_subscription' do
+  log_section("POST /create_payment_intent_for_subscription")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("POST /create_payment_intent_for_subscription", validationError)
+  end
+
+  amount         = params[:amount]
+  customer_email = params[:email] || params[:receipt_email]
+  customer_name  = params[:customer_name] || params[:name] || params['customer_name'] || params['name']
+
+  puts "[#{ts}] Input params received:"
+  puts "            amount        : #{amount.inspect}"
+  puts "            email         : #{customer_email.inspect}"
+  puts "            customer_name : #{customer_name.inspect}"
+  puts "            currency      : #{params[:currency].inspect}"
+  puts "            description   : #{params[:description].inspect}"
+
+  if amount.nil? || amount.to_s.strip.empty?
+    status 400
+    return log_error("POST /create_payment_intent_for_subscription", "'amount' is required")
+  end
+
+  log_connect_context("POST /create_payment_intent_for_subscription", "creating subscription-ready PaymentIntent")
+
+  begin
+    request_opts = connected_account_request_opts
+
+    puts "[#{ts}] --- Step 1: Resolve/create customer ---"
+    customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+    puts "[#{ts}] Customer resolved: #{customer_id}"
+
+    pi_params = {
+      :amount               => amount.to_i,
+      :currency             => params[:currency] || 'usd',
+      :customer             => customer_id,
+      :payment_method_types => ['card_present'],
+      :capture_method       => 'automatic',
+      :setup_future_usage   => 'off_session',
+    }
+
+    pi_params[:description]   = params[:description] if params[:description] && !params[:description].to_s.strip.empty?
+    pi_params[:receipt_email] = customer_email        if customer_email && !customer_email.to_s.strip.empty?
+
+    puts "[#{ts}] --- Step 2: Create PaymentIntent (setup_future_usage=off_session) ---"
+    pi_params.each { |k, v| puts "            #{k}: #{v.inspect}" }
+
+    log_stripe_request("POST /create_payment_intent_for_subscription", "Stripe::PaymentIntent.create", pi_params, request_opts)
+    payment_intent = Stripe::PaymentIntent.create(pi_params, request_opts)
+    log_stripe_response("POST /create_payment_intent_for_subscription", "PaymentIntent", payment_intent)
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("POST /create_payment_intent_for_subscription", "Failed to create subscription PaymentIntent", e)
+  end
+
+  response_payload = {
+    :intent      => payment_intent.id,
+    :secret      => payment_intent.client_secret,
+    :customer_id => customer_id,
+  }
+  puts "[#{ts}] SUCCESS  payment_intent_id=#{payment_intent.id} | customer_id=#{customer_id} | account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  status 200
+  content_type :json
+  return response_payload.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /get_payment_intent
+#
+# Retrieves a PaymentIntent with its latest_charge expanded so the Android app
+# can extract the generated_card payment method id after a successful
+# Tap to Pay payment that used setup_future_usage=off_session.
+#
+# Required query param:
+#   payment_intent_id - the PaymentIntent id (pi_xxx)
+#
+# Response includes:
+#   generated_card_id - the reusable 'card' PM id (pm_xxx) attached to the customer
+#   customer_id       - Stripe Customer id
+#   status            - PaymentIntent status
+# ─────────────────────────────────────────────────────────────────────────────
+
+get '/get_payment_intent' do
+  log_section("GET /get_payment_intent")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("GET /get_payment_intent", validationError)
+  end
+
+  payment_intent_id = params[:payment_intent_id] || params['payment_intent_id']
+
+  puts "[#{ts}] Input params received:"
+  puts "            payment_intent_id : #{payment_intent_id.inspect}"
+
+  if payment_intent_id.nil? || payment_intent_id.to_s.strip.empty?
+    status 400
+    return log_error("GET /get_payment_intent", "'payment_intent_id' is required")
+  end
+
+  log_connect_context("GET /get_payment_intent", "retrieving PaymentIntent with latest_charge expanded")
+
+  begin
+    request_opts = connected_account_request_opts
+    retrieve_params = { expand: ['latest_charge'] }
+
+    log_stripe_request("GET /get_payment_intent", "Stripe::PaymentIntent.retrieve(#{payment_intent_id})", retrieve_params, request_opts)
+    payment_intent = Stripe::PaymentIntent.retrieve({ id: payment_intent_id, expand: ['latest_charge'] }, request_opts)
+    log_stripe_response("GET /get_payment_intent", "PaymentIntent (expanded)", payment_intent)
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("GET /get_payment_intent", "Failed to retrieve PaymentIntent", e)
+  end
+
+  generated_card_id = nil
+  begin
+    charge = payment_intent.latest_charge
+    if charge && charge.respond_to?(:payment_method_details)
+      card_present = charge.payment_method_details&.card_present
+      generated_card_id = card_present&.generated_card
+    end
+  rescue => ex
+    puts "[#{ts}] [WARNING] Could not extract generated_card: #{ex.message}"
+  end
+
+  puts "[#{ts}] generated_card_id=#{generated_card_id.inspect} | customer=#{payment_intent.customer.inspect} | status=#{payment_intent.status}"
+
+  response_payload = {
+    :payment_intent_id  => payment_intent.id,
+    :status             => payment_intent.status,
+    :customer_id        => payment_intent.customer,
+    :generated_card_id  => generated_card_id,
+    :amount             => payment_intent.amount,
+    :currency           => payment_intent.currency,
+  }
+  puts "[#{ts}] SUCCESS  account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  status 200
+  content_type :json
+  return response_payload.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /list_customer_payment_methods
+#
+# Lists all saved 'card' payment methods for a customer.
+# These are the generated_card methods saved from prior Tap to Pay payments.
+#
+# Required query param:
+#   customer_id - Stripe Customer id (cus_xxx)
+#
+# Optional:
+#   email - if customer_id is not known, look up by email instead
+# ─────────────────────────────────────────────────────────────────────────────
+
+get '/list_customer_payment_methods' do
+  log_section("GET /list_customer_payment_methods")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("GET /list_customer_payment_methods", validationError)
+  end
+
+  customer_id = params[:customer_id] || params['customer_id']
+  email       = params[:email] || params['email']
+
+  puts "[#{ts}] Input params received:"
+  puts "            customer_id : #{customer_id.inspect}"
+  puts "            email       : #{email.inspect}"
+
+  begin
+    request_opts = connected_account_request_opts
+
+    if customer_id.nil? || customer_id.to_s.strip.empty?
+      if email && !email.to_s.strip.empty?
+        puts "[#{ts}] No customer_id — resolving via email=#{email}"
+        customer_id = lookupOrCreateCustomerOnConnectedAccount(email)
+      else
+        status 400
+        return log_error("GET /list_customer_payment_methods", "'customer_id' or 'email' is required")
+      end
+    end
+
+    list_params = { customer: customer_id, type: 'card', limit: 20 }
+    log_stripe_request("GET /list_customer_payment_methods", "Stripe::PaymentMethod.list", list_params, request_opts)
+    payment_methods = Stripe::PaymentMethod.list(list_params, request_opts)
+    log_stripe_response("GET /list_customer_payment_methods", "PaymentMethod list", payment_methods)
+
+    puts "[#{ts}] Found #{payment_methods.data.size} saved card(s) for customer_id=#{customer_id}"
+    payment_methods.data.each_with_index do |pm, i|
+      card = pm.card rescue nil
+      puts "            [#{i}] pm_id=#{pm.id} | brand=#{card&.brand} | last4=#{card&.last4} | exp=#{card&.exp_month}/#{card&.exp_year}"
+    end
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("GET /list_customer_payment_methods", "Failed to list payment methods", e)
+  end
+
+  response_payload = {
+    :customer_id     => customer_id,
+    :payment_methods => payment_methods.data.map do |pm|
+      card = pm.card rescue nil
+      {
+        :id         => pm.id,
+        :brand      => card&.brand,
+        :last4      => card&.last4,
+        :exp_month  => card&.exp_month,
+        :exp_year   => card&.exp_year,
+        :created    => pm.created,
+      }
+    end,
+  }
+  puts "[#{ts}] SUCCESS  customer_id=#{customer_id} | count=#{payment_methods.data.size} | account=#{CONNECTED_ACCOUNT_ID}"
+  status 200
+  content_type :json
+  return response_payload.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /create_subscription
+#
+# Creates a Stripe Subscription for a customer using a saved generated_card
+# payment method from a prior Tap to Pay payment.
+#
+# Required params:
+#   customer_id        - Stripe Customer id (cus_xxx)
+#   payment_method_id  - generated_card PM id (pm_xxx) — must be a 'card' type
+#   price_id           - Stripe Price id (price_xxx) OR use amount+interval to
+#                        auto-create a price
+#
+# Optional (used when price_id is not provided):
+#   amount             - amount in cents (e.g. 2999 for $29.99)
+#   currency           - default 'usd'
+#   interval           - 'month' | 'week' | 'year' (default 'month')
+#   interval_count     - number of intervals between billings (default 1)
+#   product_name       - name of the product/service (default 'Carwash Subscription')
+#   trial_period_days  - optional free trial days
+#   description        - subscription description / metadata note
+# ─────────────────────────────────────────────────────────────────────────────
+
+post '/create_subscription' do
+  log_section("POST /create_subscription")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("POST /create_subscription", validationError)
+  end
+
+  customer_id       = params[:customer_id]
+  payment_method_id = params[:payment_method_id]
+  price_id          = params[:price_id]
+  amount            = params[:amount]
+
+  puts "[#{ts}] Input params received:"
+  puts "            customer_id        : #{customer_id.inspect}"
+  puts "            payment_method_id  : #{payment_method_id.inspect}"
+  puts "            price_id           : #{price_id.inspect}"
+  puts "            amount             : #{amount.inspect}"
+  puts "            currency           : #{params[:currency].inspect}"
+  puts "            interval           : #{params[:interval].inspect}"
+  puts "            interval_count     : #{params[:interval_count].inspect}"
+  puts "            product_name       : #{params[:product_name].inspect}"
+  puts "            trial_period_days  : #{params[:trial_period_days].inspect}"
+  puts "            description        : #{params[:description].inspect}"
+
+  if customer_id.nil? || customer_id.to_s.strip.empty?
+    status 400
+    return log_error("POST /create_subscription", "'customer_id' is required")
+  end
+  if payment_method_id.nil? || payment_method_id.to_s.strip.empty?
+    status 400
+    return log_error("POST /create_subscription", "'payment_method_id' is required (use the generated_card id from /get_payment_intent)")
+  end
+  if price_id.nil? && (amount.nil? || amount.to_s.strip.empty?)
+    status 400
+    return log_error("POST /create_subscription", "Either 'price_id' or 'amount' is required")
+  end
+
+  log_connect_context("POST /create_subscription", "creating Stripe Subscription on connected account")
+
+  begin
+    request_opts = connected_account_request_opts
+
+    # ── Step 1: Set the payment method as the customer's default ──────────────
+    puts "[#{ts}] --- Step 1: Set default payment method on customer ---"
+    Stripe::Customer.update(
+      customer_id,
+      { invoice_settings: { default_payment_method: payment_method_id } },
+      request_opts
+    )
+    puts "[#{ts}] Default payment method set to #{payment_method_id} on #{customer_id}"
+
+    # ── Step 2: Resolve or create Price ───────────────────────────────────────
+    if price_id.nil?
+      puts "[#{ts}] --- Step 2a: Create Product ---"
+      product_name = params[:product_name] || 'Carwash Subscription'
+      product = Stripe::Product.create({ name: product_name }, request_opts)
+      puts "[#{ts}] Product created: id=#{product.id} | name=#{product.name}"
+
+      puts "[#{ts}] --- Step 2b: Create Price ---"
+      price_params = {
+        :unit_amount => amount.to_i,
+        :currency    => params[:currency] || 'usd',
+        :recurring   => {
+          :interval       => params[:interval]       || 'month',
+          :interval_count => (params[:interval_count] || 1).to_i,
+        },
+        :product     => product.id,
+      }
+
+      log_stripe_request("POST /create_subscription", "Stripe::Price.create", price_params, request_opts)
+      price = Stripe::Price.create(price_params, request_opts)
+      puts "[#{ts}] Price created: id=#{price.id} | amount=#{price.unit_amount} | interval=#{price.recurring.interval}"
+      price_id = price.id
+    else
+      puts "[#{ts}] --- Step 2: Using existing price_id=#{price_id} ---"
+    end
+
+    # ── Step 3: Create the Subscription ──────────────────────────────────────
+    puts "[#{ts}] --- Step 3: Create Subscription ---"
+    sub_params = {
+      :customer               => customer_id,
+      :default_payment_method => payment_method_id,
+      :items                  => [{ :price => price_id }],
+      :payment_settings       => {
+        :payment_method_types => ['card'],
+        :save_default_payment_method => 'on_subscription',
+      },
+      :expand => ['latest_invoice.payment_intent'],
+    }
+
+    sub_params[:trial_period_days] = params[:trial_period_days].to_i if params[:trial_period_days] && params[:trial_period_days].to_s =~ /\A\d+\z/
+    sub_params[:metadata] = { description: params[:description] } if params[:description] && !params[:description].to_s.strip.empty?
+
+    puts "[#{ts}] Subscription params being sent to Stripe:"
+    sub_params.each { |k, v| puts "            #{k}: #{v.inspect}" }
+
+    log_stripe_request("POST /create_subscription", "Stripe::Subscription.create", sub_params, request_opts)
+    subscription = Stripe::Subscription.create(sub_params, request_opts)
+    log_stripe_response("POST /create_subscription", "Subscription", subscription)
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("POST /create_subscription", "Failed to create Subscription", e)
+  end
+
+  latest_invoice     = subscription.latest_invoice rescue nil
+  latest_pi_status   = latest_invoice&.payment_intent&.status rescue nil
+
+  response_payload = {
+    :subscription_id          => subscription.id,
+    :status                   => subscription.status,
+    :customer_id              => customer_id,
+    :price_id                 => price_id,
+    :current_period_start     => subscription.current_period_start,
+    :current_period_end       => subscription.current_period_end,
+    :latest_invoice_status    => latest_invoice&.status,
+    :latest_payment_status    => latest_pi_status,
+  }
+  puts "[#{ts}] SUCCESS  subscription_id=#{subscription.id} | status=#{subscription.status} | customer=#{customer_id} | account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  status 200
+  content_type :json
+  return response_payload.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /list_subscriptions
+#
+# Lists active Stripe Subscriptions for a customer.
+#
+# Required query param:
+#   customer_id - Stripe Customer id (cus_xxx)
+#
+# Optional:
+#   status - filter by status: 'active' | 'canceled' | 'all' (default 'active')
+# ─────────────────────────────────────────────────────────────────────────────
+
+get '/list_subscriptions' do
+  log_section("GET /list_subscriptions")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("GET /list_subscriptions", validationError)
+  end
+
+  customer_id = params[:customer_id] || params['customer_id']
+  sub_status  = params[:status] || 'active'
+
+  puts "[#{ts}] Input params received:"
+  puts "            customer_id : #{customer_id.inspect}"
+  puts "            status      : #{sub_status.inspect}"
+
+  if customer_id.nil? || customer_id.to_s.strip.empty?
+    status 400
+    return log_error("GET /list_subscriptions", "'customer_id' is required")
+  end
+
+  begin
+    request_opts = connected_account_request_opts
+    list_params  = { customer: customer_id, limit: 20 }
+    list_params[:status] = sub_status unless sub_status == 'all'
+
+    log_stripe_request("GET /list_subscriptions", "Stripe::Subscription.list", list_params, request_opts)
+    subscriptions = Stripe::Subscription.list(list_params, request_opts)
+    log_stripe_response("GET /list_subscriptions", "Subscription list", subscriptions)
+
+    puts "[#{ts}] Found #{subscriptions.data.size} subscription(s) for customer_id=#{customer_id}"
+    subscriptions.data.each_with_index do |sub, i|
+      puts "            [#{i}] sub_id=#{sub.id} | status=#{sub.status} | period_end=#{sub.current_period_end}"
+    end
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("GET /list_subscriptions", "Failed to list subscriptions", e)
+  end
+
+  response_payload = {
+    :customer_id  => customer_id,
+    :subscriptions => subscriptions.data.map do |sub|
+      item = sub.items&.data&.first rescue nil
+      {
+        :id                   => sub.id,
+        :status               => sub.status,
+        :price_id             => item&.price&.id,
+        :amount               => item&.price&.unit_amount,
+        :currency             => item&.price&.currency,
+        :interval             => item&.price&.recurring&.interval,
+        :current_period_start => sub.current_period_start,
+        :current_period_end   => sub.current_period_end,
+        :trial_end            => sub.trial_end,
+        :cancel_at_period_end => sub.cancel_at_period_end,
+      }
+    end,
+  }
+  puts "[#{ts}] SUCCESS  customer_id=#{customer_id} | count=#{subscriptions.data.size} | account=#{CONNECTED_ACCOUNT_ID}"
+  status 200
+  content_type :json
+  return response_payload.to_json
+end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /cancel_subscription
+#
+# Cancels a Stripe Subscription immediately or at period end.
+#
+# Required params:
+#   subscription_id - Stripe Subscription id (sub_xxx)
+#
+# Optional params:
+#   cancel_at_period_end - 'true' to cancel at end of billing period (default: cancel immediately)
+# ─────────────────────────────────────────────────────────────────────────────
+
+post '/cancel_subscription' do
+  log_section("POST /cancel_subscription")
+
+  validationError = validateApiKey
+  if !validationError.nil?
+    status 400
+    return log_error("POST /cancel_subscription", validationError)
+  end
+
+  subscription_id      = params[:subscription_id]
+  cancel_at_period_end = params[:cancel_at_period_end].to_s.downcase == 'true'
+
+  puts "[#{ts}] Input params received:"
+  puts "            subscription_id      : #{subscription_id.inspect}"
+  puts "            cancel_at_period_end : #{cancel_at_period_end.inspect}"
+
+  if subscription_id.nil? || subscription_id.to_s.strip.empty?
+    status 400
+    return log_error("POST /cancel_subscription", "'subscription_id' is required")
+  end
+
+  log_connect_context("POST /cancel_subscription", "canceling Stripe Subscription on connected account")
+
+  begin
+    request_opts = connected_account_request_opts
+
+    if cancel_at_period_end
+      puts "[#{ts}] Canceling at period end (update cancel_at_period_end=true)"
+      log_stripe_request("POST /cancel_subscription", "Stripe::Subscription.update(#{subscription_id})", { cancel_at_period_end: true }, request_opts)
+      subscription = Stripe::Subscription.update(subscription_id, { cancel_at_period_end: true }, request_opts)
+    else
+      puts "[#{ts}] Canceling immediately"
+      log_stripe_request("POST /cancel_subscription", "Stripe::Subscription.cancel(#{subscription_id})", {}, request_opts)
+      subscription = Stripe::Subscription.cancel(subscription_id, {}, request_opts)
+    end
+
+    log_stripe_response("POST /cancel_subscription", "Subscription (canceled)", subscription)
+  rescue Stripe::StripeError => e
+    status 402
+    return log_error("POST /cancel_subscription", "Failed to cancel Subscription", e)
+  end
+
+  response_payload = {
+    :subscription_id     => subscription.id,
+    :status              => subscription.status,
+    :cancel_at_period_end => subscription.cancel_at_period_end,
+    :canceled_at         => subscription.canceled_at,
+    :current_period_end  => subscription.current_period_end,
+  }
+  puts "[#{ts}] SUCCESS  subscription_id=#{subscription_id} | status=#{subscription.status} | account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  status 200
+  content_type :json
+  return response_payload.to_json
 end
