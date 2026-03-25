@@ -278,12 +278,19 @@ post '/create_payment_intent' do
       :receipt_email => customer_email,
     }
 
-    # When this payment is the first charge of a subscription/recurring plan,
-    # instruct Stripe to save the card_present PaymentMethod for future off-session use.
-    # Native Stripe::Subscription does NOT support card_present; recurring charges must
-    # be made as manual off-session PaymentIntents using the saved PaymentMethod ID.
-    if params[:setup_future_usage] == 'off_session'
-      payment_intent_params[:setup_future_usage] = 'off_session'
+    # Save the card_present PaymentMethod on the Customer for future off-session charges
+    # (subscriptions / recurring via /create_recurring_payment). Stripe requires
+    # setup_future_usage: 'off_session' for charges when the customer will not be present.
+    # Native Stripe::Subscription does NOT support card_present.
+    # Opt out for strictly one-time sales: pass one_time=true (or one_time=1 / yes).
+    one_time = %w[true 1 yes].include?(params[:one_time].to_s.downcase)
+    unless one_time
+      sfu = params[:setup_future_usage].to_s
+      if %w[on_session off_session].include?(sfu)
+        payment_intent_params[:setup_future_usage] = sfu
+      else
+        payment_intent_params[:setup_future_usage] = 'off_session'
+      end
     end
 
     request_opts = connected_account_request_opts
