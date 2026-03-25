@@ -42,6 +42,27 @@ def connected_account_request_opts
   { stripe_account: CONNECTED_ACCOUNT_ID }
 end
 
+# Nested metadata from create_payment_intent (form-encoded metadata[key]=value).
+def payment_intent_metadata_hash(params)
+  m = params[:metadata] || params['metadata']
+  return {} unless m.is_a?(Hash)
+  m
+end
+
+# First non-empty value for any key variant (string/symbol).
+def meta_pick(meta, *key_names)
+  key_names.flatten.each do |name|
+    [name.to_s, name.to_sym].each do |k|
+      next unless meta.key?(k)
+      v = meta[k]
+      next if v.nil?
+      s = v.to_s.strip
+      return v if !s.empty?
+    end
+  end
+  nil
+end
+
 # Production Configuration Validation
 if PRODUCTION
   if Stripe.api_key.nil? || Stripe.api_key.empty? || !Stripe.api_key.start_with?('sk_live')
@@ -324,8 +345,27 @@ end
 # https://stripe.com/docs/terminal/payments#create
 # https://stripe.com/docs/terminal/features/connect#direct-payment-intents-server-side
 post '/create_payment_intent' do
+  meta = payment_intent_metadata_hash(params)
+  loc_log = params[:location_id] || params['location_id'] || meta_pick(meta, :location_id)
+  ord_log = params[:order_id] || params['order_id'] || meta_pick(meta, :order_id)
+  wash_log = meta_pick(meta, :wash_type, 'wash_type')
+  mode_log = meta_pick(meta, :paymentMode, 'paymentMode')
+  cus_hint = meta_pick(meta, :stripe_customer_id, :stripe_customer, 'stripe_customer_id', 'stripe_customer')
+  email_log = params[:email] || params[:receipt_email] || meta_pick(meta, :customer_email, :email, 'customer_email', 'email')
+
   # Log all received data from the triggering call
-  log_info("=== create_payment_intent triggered ===\nFull received params: #{params.inspect}\nRaw request body: #{request.body.read rescue 'N/A'}\nLocation ID: #{params[:location_id] || params['location_id'] || 'not provided'}\nOrder ID: #{params[:order_id] || params['order_id'] || 'not provided'}\nTags: #{params[:tags] || params['tags'] || 'not provided'}\nAll param keys: #{params.keys.inspect}")
+  log_info(
+    "=== create_payment_intent triggered ===\n" \
+    "Full received params: #{params.inspect}\n" \
+    "Raw request body: #{request.body.read rescue 'N/A'}\n" \
+    "Location ID (top-level or metadata): #{loc_log || 'not provided'}\n" \
+    "Order ID (top-level or metadata): #{ord_log || 'not provided'}\n" \
+    "wash_type (metadata): #{wash_log || 'not provided'} | paymentMode (metadata): #{mode_log || 'not provided'}\n" \
+    "Email / receipt (top-level or metadata): #{email_log || 'not provided'}\n" \
+    "stripe_customer_id hint (metadata): #{cus_hint || 'not provided'}\n" \
+    "Tags: #{params[:tags] || params['tags'] || 'not provided'}\n" \
+    "All param keys: #{params.keys.inspect}"
+  )
 
   validationError = validateApiKey
   if !validationError.nil?
@@ -336,8 +376,15 @@ post '/create_payment_intent' do
   log_connect_context("POST /create_payment_intent", "Step: creating PaymentIntent on connected account")
 
   begin
-    customer_email = params[:email] || params[:receipt_email]
-    customer_name = params[:customer_name] || params[:name] || params['customer_name'] || params['name']
+    existing_stripe_customer = meta_pick(meta, :stripe_customer_id, :stripe_customer, 'stripe_customer_id', 'stripe_customer')
+    existing_stripe_customer = existing_stripe_customer.to_s.strip if existing_stripe_customer
+    existing_stripe_customer = nil unless existing_stripe_customer&.start_with?('cus_')
+
+    customer_email = params[:email] || params[:receipt_email] ||
+      meta_pick(meta, :customer_email, :email, 'customer_email', 'email', 'receipt_email')
+    customer_name = params[:customer_name] || params[:name] || params['customer_name'] || params['name'] ||
+      meta_pick(meta, :customer_name, :name, 'customer_name', 'name')
+
     payment_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
       :capture_method => params[:capture_method] || 'manual',
@@ -364,7 +411,18 @@ post '/create_payment_intent' do
     end
 
     request_opts = connected_account_request_opts
-    connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+    if existing_stripe_customer
+      connected_customer_id = existing_stripe_customer
+      log_info("[POST /create_payment_intent] Using Stripe Customer from metadata[stripe_customer_id]: #{connected_customer_id}")
+    else
+      connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+      if wash_log && wash_log.to_s.downcase.include?('membership') && (customer_email.nil? || customer_email.to_s.strip.empty?)
+        log_info(
+          "[POST /create_payment_intent] WARN: wash_type suggests membership but no email/receipt_email (or metadata customer_email) — used walk-in customer #{connected_customer_id}. " \
+          "For subscriptions/saved cards, pass email or metadata[stripe_customer_id]=cus_... for the connected account."
+        )
+      end
+    end
     payment_intent_params[:customer] = connected_customer_id
     log_info("[POST /create_payment_intent] Step: customer #{connected_customer_id} on #{CONNECTED_ACCOUNT_ID}; creating PaymentIntent")
     
