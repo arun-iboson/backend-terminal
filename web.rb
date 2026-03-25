@@ -8,6 +8,8 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/protection'
+require 'net/http'
+require 'uri'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -17,6 +19,18 @@ set :bind, '0.0.0.0'
 # Load environment variables
 # Load .env file if it exists (for local development)
 Dotenv.load if File.exist?('.env')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIREBASE REALTIME DATABASE (logs)
+# URL = your Realtime Database host (correct for project stripe-backend-ed4ed).
+# SECRET = legacy Database secret from Firebase Console → ⚙ Project settings →
+#          Service accounts → Database secrets — NOT the project id (stripe-backend-ed4ed).
+#          https://console.firebase.google.com/project/stripe-backend-ed4ed/settings/serviceaccounts/databasesecrets
+# Leave FIREBASE_DB_SECRET empty to disable Firebase logging (console logs still run).
+# ─────────────────────────────────────────────────────────────────────────────
+FIREBASE_DB_URL    = 'https://stripe-backend-ed4ed-default-rtdb.firebaseio.com'.freeze
+FIREBASE_DB_SECRET = ''.freeze # paste your Database secret string here
+FIREBASE_ENABLED   = !FIREBASE_DB_SECRET.nil? && !FIREBASE_DB_SECRET.strip.empty?
 
 # Production/Environment Configuration
 PRODUCTION = ENV['RACK_ENV'] == 'production' || ENV['ENVIRONMENT'] == 'production'
@@ -59,14 +73,41 @@ def ts
   Time.now.strftime('%Y-%m-%d %H:%M:%S.%L')
 end
 
+# Push a log payload to Firebase Realtime Database asynchronously.
+# Runs in a background thread so it never blocks request handling.
+# Silently skips if Firebase secret is not configured.
+def firebase_log(payload)
+  return unless FIREBASE_ENABLED
+  Thread.new do
+    begin
+      uri = URI("#{FIREBASE_DB_URL}/logs.json")
+      uri.query = URI.encode_www_form('auth' => FIREBASE_DB_SECRET)
+      http = Net::HTTP.new(uri.host, uri.port)
+      http.use_ssl = true
+      http.open_timeout = 3
+      http.read_timeout = 5
+      req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
+      req.body = payload.merge(
+        ts:  Time.now.utc.iso8601(3),
+        env: defined?(STRIPE_ENV) ? STRIPE_ENV : 'unknown'
+      ).to_json
+      http.request(req)
+    rescue => _e
+      # intentionally silent — Firebase logging must never crash the main app
+    end
+  end
+end
+
 def log_section(title)
   puts "\n#{LOG_SEP}"
   puts "  #{ts}  #{title}"
   puts LOG_SEP
+  firebase_log(level: 'section', message: title)
 end
 
 def log_info(message)
   puts "[#{ts}] #{message}"
+  firebase_log(level: 'info', message: message)
   return message
 end
 
@@ -74,6 +115,7 @@ def log_kv(label, hash)
   return if hash.nil? || (hash.respond_to?(:empty?) && hash.empty?)
   puts "[#{ts}] #{label}:"
   hash.each { |k, v| puts "            #{k}: #{v}" }
+  firebase_log(level: 'kv', label: label, data: hash)
 end
 
 def log_stripe_request(endpoint, stripe_method, stripe_params, request_opts)
@@ -81,6 +123,13 @@ def log_stripe_request(endpoint, stripe_method, stripe_params, request_opts)
   puts "            Method : #{stripe_method}"
   puts "            Params : #{stripe_params.to_json rescue stripe_params.inspect}"
   puts "            Opts   : #{request_opts.inspect}"
+  firebase_log(
+    level:    'stripe_request',
+    endpoint: endpoint,
+    method:   stripe_method.to_s,
+    params:   (stripe_params.to_json rescue stripe_params.inspect),
+    opts:     request_opts.inspect
+  )
 end
 
 def log_stripe_response(endpoint, object_type, response)
@@ -91,12 +140,24 @@ def log_stripe_response(endpoint, object_type, response)
   rescue => ex
     puts "            (could not serialize response: #{ex.message})"
   end
+  response_json = begin
+    response.to_hash.to_json
+  rescue
+    response.inspect
+  end
+  firebase_log(
+    level:    'stripe_response',
+    endpoint: endpoint,
+    type:     object_type.to_s,
+    response: response_json
+  )
 end
 
 def log_connect_context(endpoint, step = nil)
   msg = "[#{ts}] [#{endpoint}] stripe_account=#{CONNECTED_ACCOUNT_ID}"
   msg += " | #{step}" if step
   puts msg
+  firebase_log(level: 'connect', endpoint: endpoint, step: step, stripe_account: CONNECTED_ACCOUNT_ID)
 end
 
 def log_error(endpoint, message, exception = nil)
@@ -121,6 +182,22 @@ def log_error(endpoint, message, exception = nil)
   end
   full = "[#{endpoint}] Error: #{message}"
   full += " | #{exception.class} - #{exception.message}" if exception
+  ex_payload = if exception
+    {
+      class:       exception.class.to_s,
+      message:     exception.message,
+      http_status: (exception.http_status rescue nil),
+      code:        (exception.code rescue nil),
+      body:        (exception.json_body.to_json rescue nil),
+      trace:       exception.backtrace&.first(5)&.join(' | ')
+    }.compact
+  end
+  firebase_log(
+    level:     'error',
+    endpoint:  endpoint,
+    message:   message,
+    exception: ex_payload
+  )
   return full
 end
 
@@ -137,6 +214,7 @@ puts "  Stripe API version : #{Stripe.api_version}"
 puts "  Connected account  : #{CONNECTED_ACCOUNT_ID}"
 key = Stripe.api_key.to_s
 puts "  API key (masked)   : #{key.empty? ? '(none)' : key[0..6] + '...' + key[-4..]}"
+puts "  Firebase logging   : #{FIREBASE_ENABLED ? "ENABLED  (#{FIREBASE_DB_URL}/logs)" : 'DISABLED (paste FIREBASE_DB_SECRET in web.rb to enable)'}"
 puts LOG_SEP + "\n\n"
 
 # ─────────────────────────────────────────────────────────────────────────────
