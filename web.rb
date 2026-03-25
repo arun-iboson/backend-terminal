@@ -495,9 +495,10 @@ post '/update_payment_intent' do
   return {:intent => payment_intent.id, :secret => payment_intent.client_secret}.to_json
 end
 
-# Creates an off-session recurring charge using a previously saved card_present PaymentMethod.
-# Use this instead of Stripe::Subscription for Terminal tap-to-pay / card_present recurring billing.
-# Stripe Subscriptions only support the `card` type; card_present must use manual off-session PIs.
+# Creates an off-session recurring charge using a previously saved generated_card PaymentMethod.
+# Use this instead of Stripe::Subscription for Terminal tap-to-pay recurring billing.
+# The initial in-person payment is card_present, but recurring re-use is card-not-present
+# using the generated_card PaymentMethod (type: card).
 #
 # Required params:
 #   payment_method_id — the saved card_present PaymentMethod ID (pm_...)
@@ -532,7 +533,7 @@ post '/create_recurring_payment' do
     return log_error("POST /create_recurring_payment", "'amount' is required")
   end
 
-  log_connect_context("POST /create_recurring_payment", "Step: creating off-session PaymentIntent for saved card_present")
+  log_connect_context("POST /create_recurring_payment", "Step: creating off-session PaymentIntent for saved generated_card")
 
   begin
     request_opts = connected_account_request_opts
@@ -542,7 +543,7 @@ post '/create_recurring_payment' do
       :currency             => params[:currency] || 'usd',
       :customer             => customer_id,
       :payment_method       => payment_method_id,
-      :payment_method_types => ['card_present'],
+      :payment_method_types => ['card'],
       :confirm              => true,
       :off_session          => true,
       :capture_method       => 'automatic',
