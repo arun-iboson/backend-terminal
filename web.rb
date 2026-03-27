@@ -8,8 +8,6 @@ require 'dotenv'
 require 'json'
 require 'sinatra/cross_origin'
 require 'rack/protection'
-require 'net/http'
-require 'uri'
 
 # Set the port from environment variable or default to 4567
 # This ensures compatibility with Railway, Render, Heroku, and other platforms
@@ -19,18 +17,6 @@ set :bind, '0.0.0.0'
 # Load environment variables
 # Load .env file if it exists (for local development)
 Dotenv.load if File.exist?('.env')
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FIREBASE REALTIME DATABASE (logs)
-# URL = your Realtime Database host (correct for project stripe-backend-ed4ed).
-# SECRET = legacy Database secret from Firebase Console → ⚙ Project settings →
-#          Service accounts → Database secrets — NOT the project id (stripe-backend-ed4ed).
-#          https://console.firebase.google.com/project/stripe-backend-ed4ed/settings/serviceaccounts/databasesecrets
-# Leave FIREBASE_DB_SECRET empty to disable Firebase logging (console logs still run).
-# ─────────────────────────────────────────────────────────────────────────────
-FIREBASE_DB_URL    = 'https://stripe-backend-ed4ed-default-rtdb.firebaseio.com'.freeze
-FIREBASE_DB_SECRET = ''.freeze # paste your Database secret string here
-FIREBASE_ENABLED   = !FIREBASE_DB_SECRET.nil? && !FIREBASE_DB_SECRET.strip.empty?
 
 # Production/Environment Configuration
 PRODUCTION = ENV['RACK_ENV'] == 'production' || ENV['ENVIRONMENT'] == 'production'
@@ -46,14 +32,40 @@ Stripe.api_version = '2024-09-30.acacia'
 
 # The Stripe Connect account this backend operates on behalf of (direct charges).
 # Set STRIPE_CONNECTED_ACCOUNT_ID in your environment / .env file.
-CONNECTED_ACCOUNT_ID = (ENV['STRIPE_CONNECTED_ACCOUNT_ID'] || 'acct_1T5aDBBfHXwLiSAu').freeze
+CONNECTED_ACCOUNT_ID = (ENV['STRIPE_CONNECTED_ACCOUNT_ID'] || '').freeze
 
 if CONNECTED_ACCOUNT_ID.nil? || CONNECTED_ACCOUNT_ID.strip.empty?
   raise "FATAL: STRIPE_CONNECTED_ACCOUNT_ID environment variable is not set."
 end
 
-def connected_account_request_opts
-  { stripe_account: CONNECTED_ACCOUNT_ID }
+# When true, request body/query may include stripe_account_id=acct_... for multi-tenant direct charges.
+# See https://docs.stripe.com/terminal/features/connect?connect-charge-type=direct
+STRIPE_ALLOW_PARAM_ACCOUNT_ID = (ENV['STRIPE_ALLOW_PARAM_ACCOUNT_ID'] || '').strip.casecmp('true').zero?
+
+def resolve_connected_account_id(params)
+  p = params || {}
+  raw = p[:stripe_account_id] || p['stripe_account_id'] || p[:stripe_account] || p['stripe_account']
+  return CONNECTED_ACCOUNT_ID if raw.nil? || raw.to_s.strip.empty?
+  acct = raw.to_s.strip
+  return CONNECTED_ACCOUNT_ID unless acct.match?(/\Aacct_[a-zA-Z0-9]+\z/)
+  if STRIPE_ALLOW_PARAM_ACCOUNT_ID
+    puts "[#{ts}] [resolve_connected_account_id] Using stripe_account_id from request: #{acct}"
+    return acct
+  end
+  if acct != CONNECTED_ACCOUNT_ID
+    puts "[#{ts}] [resolve_connected_account_id] WARN: request stripe_account_id=#{acct} ≠ STRIPE_CONNECTED_ACCOUNT_ID=#{CONNECTED_ACCOUNT_ID}. Using env default. " \
+         "Set STRIPE_ALLOW_PARAM_ACCOUNT_ID=true to honor the param (direct charges), or align STRIPE_CONNECTED_ACCOUNT_ID with the app."
+  end
+  CONNECTED_ACCOUNT_ID
+end
+
+def connected_account_request_opts(params = {})
+  { stripe_account: resolve_connected_account_id(params) }
+end
+
+# Stripe Terminal Location ids are tml_... (not your SaaS UUID).
+def stripe_terminal_location_id?(s)
+  s.to_s.strip.match?(/\Atml_[a-zA-Z0-9]+\z/)
 end
 
 # Production Configuration Validation
@@ -73,91 +85,54 @@ def ts
   Time.now.strftime('%Y-%m-%d %H:%M:%S.%L')
 end
 
-# Push a log payload to Firebase Realtime Database asynchronously.
-# Runs in a background thread so it never blocks request handling.
-# Silently skips if Firebase secret is not configured.
-def firebase_log(payload)
-  return unless FIREBASE_ENABLED
-  Thread.new do
-    begin
-      uri = URI("#{FIREBASE_DB_URL}/logs.json")
-      uri.query = URI.encode_www_form('auth' => FIREBASE_DB_SECRET)
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = true
-      http.open_timeout = 3
-      http.read_timeout = 5
-      req = Net::HTTP::Post.new(uri.request_uri, 'Content-Type' => 'application/json')
-      req.body = payload.merge(
-        ts:  Time.now.utc.iso8601(3),
-        env: defined?(STRIPE_ENV) ? STRIPE_ENV : 'unknown'
-      ).to_json
-      http.request(req)
-    rescue => _e
-      # intentionally silent — Firebase logging must never crash the main app
-    end
-  end
-end
-
 def log_section(title)
   puts "\n#{LOG_SEP}"
   puts "  #{ts}  #{title}"
   puts LOG_SEP
-  firebase_log(level: 'section', message: title)
 end
 
 def log_info(message)
   puts "[#{ts}] #{message}"
-  firebase_log(level: 'info', message: message)
-  return message
+  message
 end
 
 def log_kv(label, hash)
   return if hash.nil? || (hash.respond_to?(:empty?) && hash.empty?)
   puts "[#{ts}] #{label}:"
   hash.each { |k, v| puts "            #{k}: #{v}" }
-  firebase_log(level: 'kv', label: label, data: hash)
 end
 
 def log_stripe_request(endpoint, stripe_method, stripe_params, request_opts)
   puts "[#{ts}] >>> STRIPE API CALL  [#{endpoint}]"
   puts "            Method : #{stripe_method}"
-  puts "            Params : #{stripe_params.to_json rescue stripe_params.inspect}"
+  begin
+    puts "            Params : #{stripe_params.to_json}"
+  rescue StandardError
+    puts "            Params : #{stripe_params.inspect}"
+  end
   puts "            Opts   : #{request_opts.inspect}"
-  firebase_log(
-    level:    'stripe_request',
-    endpoint: endpoint,
-    method:   stripe_method.to_s,
-    params:   (stripe_params.to_json rescue stripe_params.inspect),
-    opts:     request_opts.inspect
-  )
 end
 
 def log_stripe_response(endpoint, object_type, response)
   puts "[#{ts}] <<< STRIPE RESPONSE  [#{endpoint}]"
   puts "            Type   : #{object_type}"
   begin
-    puts "            JSON   : #{response.to_hash.to_json rescue response.inspect}"
-  rescue => ex
+    puts "            JSON   : #{response.to_hash.to_json}"
+  rescue StandardError => ex
     puts "            (could not serialize response: #{ex.message})"
   end
-  response_json = begin
-    response.to_hash.to_json
-  rescue
-    response.inspect
-  end
-  firebase_log(
-    level:    'stripe_response',
-    endpoint: endpoint,
-    type:     object_type.to_s,
-    response: response_json
-  )
 end
 
-def log_connect_context(endpoint, step = nil)
-  msg = "[#{ts}] [#{endpoint}] stripe_account=#{CONNECTED_ACCOUNT_ID}"
+def log_connect_context(endpoint, step = nil, params = nil)
+  acct = params.nil? ? CONNECTED_ACCOUNT_ID : resolve_connected_account_id(params)
+  msg = "[#{ts}] [#{endpoint}] stripe_account_id=#{acct}"
   msg += " | #{step}" if step
   puts msg
-  firebase_log(level: 'connect', endpoint: endpoint, step: step, stripe_account: CONNECTED_ACCOUNT_ID)
+end
+
+def mask_secret(s)
+  return '(nil)' if s.nil?
+  s.length > 12 ? "#{s[0..11]}...(masked)" : '(too short to mask)'
 end
 
 def log_error(endpoint, message, exception = nil)
@@ -172,32 +147,29 @@ def log_error(endpoint, message, exception = nil)
       puts "            Code   : #{exception.code}"
     end
     if exception.respond_to?(:error)
-      err = exception.error rescue nil
-      puts "            Error  : #{err.inspect}" if err
+      begin
+        err = exception.error
+        puts "            Error  : #{err.inspect}" if err
+      rescue StandardError
+      end
     end
     if exception.respond_to?(:json_body)
-      puts "            Body   : #{exception.json_body.to_json rescue exception.json_body.inspect}"
+      begin
+        puts "            Body   : #{exception.json_body.to_json}"
+      rescue StandardError
+        puts "            Body   : #{exception.json_body.inspect}"
+      end
+    end
+    em = exception.message.to_s
+    if em.match?(/no such location/i)
+      puts "            [CAUSE: Terminal + Connect direct charges] ConnectionToken location must be a Terminal Location id (tml_...) that exists ON THE SAME connected account as the Stripe-Account header. " \
+           "Do not pass your app’s location UUID. Create/list locations with this backend (GET /list_locations?stripe_account_id=...) so ids match the account. " \
+           "Docs: https://docs.stripe.com/terminal/features/connect?connect-charge-type=direct"
     end
     puts "            Trace  : #{exception.backtrace&.first(5)&.join(' | ')}"
   end
   full = "[#{endpoint}] Error: #{message}"
   full += " | #{exception.class} - #{exception.message}" if exception
-  ex_payload = if exception
-    {
-      class:       exception.class.to_s,
-      message:     exception.message,
-      http_status: (exception.http_status rescue nil),
-      code:        (exception.code rescue nil),
-      body:        (exception.json_body.to_json rescue nil),
-      trace:       exception.backtrace&.first(5)&.join(' | ')
-    }.compact
-  end
-  firebase_log(
-    level:     'error',
-    endpoint:  endpoint,
-    message:   message,
-    exception: ex_payload
-  )
   return full
 end
 
@@ -208,13 +180,15 @@ end
 puts "\n#{LOG_SEP}"
 puts "  CARWASH STRIPE TERMINAL BACKEND  —  #{ts}"
 puts LOG_SEP
-puts "  STRIPE_ENV         : #{STRIPE_ENV}"
-puts "  PRODUCTION         : #{PRODUCTION}"
+puts "  RACK_ENV           : #{ENV['RACK_ENV'].inspect}"
+puts "  ENVIRONMENT        : #{ENV['ENVIRONMENT'].inspect}"
+puts "  PRODUCTION (host)  : #{PRODUCTION}  ← true when RACK_ENV or ENVIRONMENT is production"
+puts "  STRIPE_ENV         : #{STRIPE_ENV}  ← live keys when production; else STRIPE_TEST_SECRET_KEY"
 puts "  Stripe API version : #{Stripe.api_version}"
 puts "  Connected account  : #{CONNECTED_ACCOUNT_ID}"
+puts "  Allow param acct   : #{STRIPE_ALLOW_PARAM_ACCOUNT_ID} (STRIPE_ALLOW_PARAM_ACCOUNT_ID=true → honor request stripe_account_id)"
 key = Stripe.api_key.to_s
 puts "  API key (masked)   : #{key.empty? ? '(none)' : key[0..6] + '...' + key[-4..]}"
-puts "  Firebase logging   : #{FIREBASE_ENABLED ? "ENABLED  (#{FIREBASE_DB_URL}/logs)" : 'DISABLED (paste FIREBASE_DB_SECRET in web.rb to enable)'}"
 puts LOG_SEP + "\n\n"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,8 +249,8 @@ end
 # API KEY VALIDATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def validateApiKey
-  puts "[#{ts}] [validateApiKey] STRIPE_ENV=#{STRIPE_ENV} | key_present=#{!Stripe.api_key.to_s.empty?}"
+def validate_api_key
+  puts "[#{ts}] [validate_api_key] STRIPE_ENV=#{STRIPE_ENV} | key_present=#{!Stripe.api_key.to_s.empty?}"
   if Stripe.api_key.nil? || Stripe.api_key.empty?
     mode = STRIPE_ENV == 'production' ? 'production' : 'test'
     return "Error: you provided an empty secret key. Please provide your #{mode} mode secret key."
@@ -296,7 +270,7 @@ def validateApiKey
       return "Error: invalid secret key format. Expected sk_test_..."
     end
   end
-  puts "[#{ts}] [validateApiKey] OK"
+  puts "[#{ts}] [validate_api_key] OK"
   return nil
 end
 
@@ -314,9 +288,15 @@ get '/health' do
   log_section("GET /health")
   payload = {
     :status            => 'ok',
+    # Host "production" enables HSTS, live-key warning at boot — driven by RACK_ENV / ENVIRONMENT.
+    :production_host   => PRODUCTION,
+    :rack_env          => ENV['RACK_ENV'],
+    :environment       => ENV['ENVIRONMENT'],
+    # Stripe live vs test keys — driven by STRIPE_ENV (or defaults from production_host).
     :stripe_env        => STRIPE_ENV,
     :api_version       => Stripe.api_version,
     :connected_account => CONNECTED_ACCOUNT_ID,
+    :stripe_key_configured => !Stripe.api_key.to_s.empty?,
   }
   puts "[#{ts}] Health response: #{payload.to_json}"
   status 200
@@ -331,13 +311,13 @@ end
 post '/register_reader' do
   log_section("POST /register_reader")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /register_reader", validationError)
   end
 
-  log_connect_context("POST /register_reader", "registering reader on connected account")
+  log_connect_context("POST /register_reader", "registering reader on connected account", params)
 
   reader_params = {
     :registration_code => params[:registration_code],
@@ -351,8 +331,8 @@ post '/register_reader' do
   puts "            location          : #{params[:location].inspect}"
 
   begin
-    log_stripe_request("POST /register_reader", "Stripe::Terminal::Reader.create", reader_params, connected_account_request_opts)
-    reader = Stripe::Terminal::Reader.create(reader_params, connected_account_request_opts)
+    log_stripe_request("POST /register_reader", "Stripe::Terminal::Reader.create", reader_params, connected_account_request_opts(params))
+    reader = Stripe::Terminal::Reader.create(reader_params, connected_account_request_opts(params))
     log_stripe_response("POST /register_reader", "Terminal::Reader", reader)
   rescue Stripe::StripeError => e
     status 402
@@ -371,31 +351,62 @@ end
 post '/connection_token' do
   log_section("POST /connection_token")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /connection_token", validationError)
   end
+
+  request_opts = connected_account_request_opts(params)
+  acct         = request_opts[:stripe_account]
 
   location_id = params[:location] || params['location_id']
   puts "[#{ts}] Input params received:"
   puts "            location (param :location)   : #{params[:location].inspect}"
   puts "            location_id (param key)       : #{params['location_id'].inspect}"
   puts "            resolved location_id          : #{location_id.inspect}"
+  puts "            stripe_account_id (param)     : #{(params[:stripe_account_id] || params['stripe_account_id']).inspect}"
+  puts "            effective Stripe-Account        : #{acct}"
 
-  log_connect_context("POST /connection_token", "creating ConnectionToken on connected account")
+  log_connect_context("POST /connection_token", "creating ConnectionToken on connected account", params)
 
   token_params = {}
   if location_id && !location_id.to_s.strip.empty?
-    token_params[:location] = location_id.strip
+    lid = location_id.strip
+    unless stripe_terminal_location_id?(lid)
+      status 400
+      content_type :json
+      return {
+        :error => 'invalid_terminal_location_id',
+        :message => 'For Connect direct charges, pass a Stripe Terminal location id (tml_...). Internal app location UUIDs are invalid and cause "No such location". Use GET /list_locations with the same stripe_account_id, or POST /create_location, then pass the returned id as location=.',
+        :received => lid,
+        :stripe_account_id => acct,
+      }.to_json
+    end
+    begin
+      log_stripe_request("POST /connection_token", "Stripe::Terminal::Location.retrieve(#{lid})", {}, request_opts)
+      Stripe::Terminal::Location.retrieve(lid, request_opts)
+      puts "[#{ts}] Location verified on connected account: #{lid}"
+    rescue Stripe::StripeError => e
+      status 400
+      content_type :json
+      log_error("POST /connection_token", "Terminal Location not found on this connected account", e)
+      return {
+        :error => 'terminal_location_not_found',
+        :message => "No Terminal Location #{lid} on connected account #{acct}. With direct charges, locations must be created on that connected account (see Stripe docs).",
+        :stripe_account_id => acct,
+        :stripe_code => (e.code if e.respond_to?(:code)),
+      }.to_json
+    end
+    token_params[:location] = lid
     puts "[#{ts}] Location scoping ENABLED: #{token_params[:location]}"
   else
-    puts "[#{ts}] Location scoping NOT set — token valid for ALL readers on account"
+    puts "[#{ts}] Location scoping NOT set — token valid for ALL readers on this connected account"
   end
 
   begin
-    log_stripe_request("POST /connection_token", "Stripe::Terminal::ConnectionToken.create", token_params, connected_account_request_opts)
-    token = Stripe::Terminal::ConnectionToken.create(token_params, connected_account_request_opts)
+    log_stripe_request("POST /connection_token", "Stripe::Terminal::ConnectionToken.create", token_params, request_opts)
+    token = Stripe::Terminal::ConnectionToken.create(token_params, request_opts)
     puts "[#{ts}] <<< STRIPE RESPONSE  [POST /connection_token]"
     puts "            Type   : Terminal::ConnectionToken"
     puts "            secret : #{token.secret[0..8]}... (truncated for security)"
@@ -405,8 +416,8 @@ post '/connection_token' do
   end
 
   response_payload = {:secret => token.secret}
-  puts "[#{ts}] SUCCESS  account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: { secret: '#{token.secret[0..8]}...' }"
+  puts "[#{ts}] SUCCESS  stripe_account_id=#{acct}"
+  puts "[#{ts}] Response to client: { secret: '#{mask_secret(token.secret)}' }"
   content_type :json
   status 200
   return response_payload.to_json
@@ -416,14 +427,15 @@ end
 # HELPER: Look up or create a Customer on the connected account
 # ─────────────────────────────────────────────────────────────────────────────
 
-def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
-  request_opts = connected_account_request_opts
+def lookup_or_create_customer(customerEmail, customer_name = nil, request_opts = nil)
+  request_opts ||= connected_account_request_opts({})
+  acct = request_opts[:stripe_account]
   email = customerEmail.to_s.strip
   email = nil if email.empty?
   name  = customer_name.to_s.strip
   name  = nil if name.empty?
 
-  puts "[#{ts}] [Customer] Input  email=#{email.inspect} | name=#{name.inspect} | account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] [Customer] Input  email=#{email.inspect} | name=#{name.inspect} | account=#{acct}"
 
   begin
     if email
@@ -459,7 +471,7 @@ def lookupOrCreateCustomerOnConnectedAccount(customerEmail, customer_name = nil)
       return newCustomer.id
     end
   rescue Stripe::StripeError => e
-    log_error("lookupOrCreateCustomerOnConnectedAccount", "Creating or retrieving customer", e)
+    log_error("lookup_or_create_customer", "Creating or retrieving customer", e)
     raise
   end
 end
@@ -500,13 +512,13 @@ post '/create_payment_intent' do
   puts "            order_id             : #{(params[:order_id] || params['order_id']).inspect}"
   puts "            tags                 : #{(params[:tags] || params['tags']).inspect}"
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_payment_intent", validationError)
   end
 
-  log_connect_context("POST /create_payment_intent", "creating PaymentIntent on connected account")
+  log_connect_context("POST /create_payment_intent", "creating PaymentIntent on connected account", params)
 
   begin
     customer_email = params[:email] || params[:receipt_email]
@@ -529,10 +541,10 @@ post '/create_payment_intent' do
       puts "[#{ts}] setup_future_usage=off_session SET (saving card for recurring)"
     end
 
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     puts "[#{ts}] --- Step 1: Resolve/create customer ---"
-    connected_customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+    connected_customer_id = lookup_or_create_customer(customer_email, customer_name, request_opts)
     payment_intent_params[:customer] = connected_customer_id
     puts "[#{ts}] Customer resolved: #{connected_customer_id}"
 
@@ -562,8 +574,8 @@ post '/create_payment_intent' do
   end
 
   response_payload = { :intent => payment_intent.id, :secret => payment_intent.client_secret }
-  puts "[#{ts}] SUCCESS  payment_intent_id=#{payment_intent.id} | status=#{payment_intent.status} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  puts "[#{ts}] SUCCESS  payment_intent_id=#{payment_intent.id} | status=#{payment_intent.status} | stripe_account_id=#{resolve_connected_account_id(params)}"
+  puts "[#{ts}] Response to client: { intent: '#{payment_intent.id}', secret: '#{mask_secret(payment_intent.client_secret)}' }"
   status 200
   return response_payload.to_json
 end
@@ -575,6 +587,12 @@ end
 post '/capture_payment_intent' do
   log_section("POST /capture_payment_intent")
 
+  validationError = validate_api_key
+  if validationError
+    status 400
+    return log_error("POST /capture_payment_intent", validationError)
+  end
+
   id              = params["payment_intent_id"]
   amount_override = params["amount_to_capture"]
 
@@ -582,12 +600,17 @@ post '/capture_payment_intent' do
   puts "            payment_intent_id : #{id.inspect}"
   puts "            amount_to_capture : #{amount_override.inspect}"
 
-  log_connect_context("POST /capture_payment_intent", "capturing PaymentIntent on connected account")
+  if id.nil? || id.to_s.strip.empty?
+    status 400
+    return log_error("POST /capture_payment_intent", "'payment_intent_id' is required")
+  end
+
+  log_connect_context("POST /capture_payment_intent", "capturing PaymentIntent on connected account", params)
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
-    if !amount_override.nil?
+    if amount_override
       capture_params = { amount_to_capture: amount_override }
       log_stripe_request("POST /capture_payment_intent", "Stripe::PaymentIntent.capture(#{id})", capture_params, request_opts)
       payment_intent = Stripe::PaymentIntent.capture(id, capture_params, request_opts)
@@ -603,8 +626,9 @@ post '/capture_payment_intent' do
   end
 
   response_payload = { :intent => payment_intent.id, :secret => payment_intent.client_secret }
-  puts "[#{ts}] SUCCESS  payment_intent_id=#{id} | new_status=#{payment_intent.status} | amount_captured=#{payment_intent.amount_received rescue 'n/a'} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  amount_captured = begin; payment_intent.amount_received; rescue StandardError; 'n/a'; end
+  puts "[#{ts}] SUCCESS  payment_intent_id=#{id} | new_status=#{payment_intent.status} | amount_captured=#{amount_captured} | account=#{CONNECTED_ACCOUNT_ID}"
+  puts "[#{ts}] Response to client: { intent: '#{payment_intent.id}', secret: '#{mask_secret(payment_intent.client_secret)}' }"
   status 200
   return response_payload.to_json
 end
@@ -616,15 +640,26 @@ end
 post '/cancel_payment_intent' do
   log_section("POST /cancel_payment_intent")
 
+  validationError = validate_api_key
+  if validationError
+    status 400
+    return log_error("POST /cancel_payment_intent", validationError)
+  end
+
   id = params["payment_intent_id"]
   puts "[#{ts}] Input params received:"
   puts "            payment_intent_id : #{id.inspect}"
 
-  log_connect_context("POST /cancel_payment_intent", "canceling PaymentIntent on connected account")
+  if id.nil? || id.to_s.strip.empty?
+    status 400
+    return log_error("POST /cancel_payment_intent", "'payment_intent_id' is required")
+  end
+
+  log_connect_context("POST /cancel_payment_intent", "canceling PaymentIntent on connected account", params)
 
   begin
-    log_stripe_request("POST /cancel_payment_intent", "Stripe::PaymentIntent.cancel(#{id})", {}, connected_account_request_opts)
-    payment_intent = Stripe::PaymentIntent.cancel(id, {}, connected_account_request_opts)
+    log_stripe_request("POST /cancel_payment_intent", "Stripe::PaymentIntent.cancel(#{id})", {}, connected_account_request_opts(params))
+    payment_intent = Stripe::PaymentIntent.cancel(id, {}, connected_account_request_opts(params))
     log_stripe_response("POST /cancel_payment_intent", "PaymentIntent (canceled)", payment_intent)
   rescue Stripe::StripeError => e
     status 402
@@ -633,7 +668,7 @@ post '/cancel_payment_intent' do
 
   response_payload = { :intent => payment_intent.id, :secret => payment_intent.client_secret }
   puts "[#{ts}] SUCCESS  payment_intent_id=#{id} | new_status=#{payment_intent.status} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  puts "[#{ts}] Response to client: { intent: '#{payment_intent.id}', secret: '#{mask_secret(payment_intent.client_secret)}' }"
   status 200
   return response_payload.to_json
 end
@@ -645,8 +680,8 @@ end
 post '/create_setup_intent' do
   log_section("POST /create_setup_intent")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_setup_intent", validationError)
   end
@@ -657,22 +692,22 @@ post '/create_setup_intent' do
   puts "            description          : #{params[:description].inspect}"
   puts "            on_behalf_of         : #{params[:on_behalf_of].inspect}"
 
-  log_connect_context("POST /create_setup_intent", "creating SetupIntent on connected account")
+  log_connect_context("POST /create_setup_intent", "creating SetupIntent on connected account", params)
 
   begin
     setup_intent_params = {
       :payment_method_types => params[:payment_method_types] || ['card_present'],
     }
-    setup_intent_params[:customer]      = params[:customer]      if !params[:customer].nil?
-    setup_intent_params[:description]   = params[:description]   if !params[:description].nil?
-    setup_intent_params[:on_behalf_of]  = params[:on_behalf_of]  if !params[:on_behalf_of].nil?
+    setup_intent_params[:customer]      = params[:customer]      if params[:customer]
+    setup_intent_params[:description]   = params[:description]   if params[:description]
+    setup_intent_params[:on_behalf_of]  = params[:on_behalf_of]  if params[:on_behalf_of]
 
     puts "[#{ts}] SetupIntent params being sent to Stripe:"
     setup_intent_params.each { |k, v| puts "            #{k}: #{v.inspect}" }
-    puts "[#{ts}] Request opts: #{connected_account_request_opts.inspect}"
+    puts "[#{ts}] Request opts: #{connected_account_request_opts(params).inspect}"
 
-    log_stripe_request("POST /create_setup_intent", "Stripe::SetupIntent.create", setup_intent_params, connected_account_request_opts)
-    setup_intent = Stripe::SetupIntent.create(setup_intent_params, connected_account_request_opts)
+    log_stripe_request("POST /create_setup_intent", "Stripe::SetupIntent.create", setup_intent_params, connected_account_request_opts(params))
+    setup_intent = Stripe::SetupIntent.create(setup_intent_params, connected_account_request_opts(params))
     log_stripe_response("POST /create_setup_intent", "SetupIntent", setup_intent)
   rescue Stripe::StripeError => e
     status 402
@@ -681,7 +716,7 @@ post '/create_setup_intent' do
 
   response_payload = { :intent => setup_intent.id, :secret => setup_intent.client_secret }
   puts "[#{ts}] SUCCESS  setup_intent_id=#{setup_intent.id} | status=#{setup_intent.status} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  puts "[#{ts}] Response to client: { intent: '#{setup_intent.id}', secret: '#{mask_secret(setup_intent.client_secret)}' }"
   status 200
   return response_payload.to_json
 end
@@ -690,10 +725,10 @@ end
 # HELPER: Look up or create example@test.com customer (saved-card demo)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def lookupOrCreateExampleCustomerOnConnectedAccount
+def lookup_or_create_example_customer
   customerEmail = "example@test.com"
-  request_opts  = connected_account_request_opts
-  puts "[#{ts}] [ExampleCustomer] looking up #{customerEmail} on account=#{CONNECTED_ACCOUNT_ID}"
+  request_opts  = connected_account_request_opts({})
+  puts "[#{ts}] [ExampleCustomer] looking up #{customerEmail} on account=#{request_opts[:stripe_account]}"
   begin
     list_params = { email: customerEmail, limit: 1 }
     log_stripe_request("ExampleCustomer.list", "Stripe::Customer.list", list_params, request_opts)
@@ -711,7 +746,7 @@ def lookupOrCreateExampleCustomerOnConnectedAccount
     end
   rescue Stripe::StripeError => e
     status 402
-    return log_error("lookupOrCreateExampleCustomerOnConnectedAccount", "Creating or retrieving example customer", e)
+    return log_error("lookup_or_create_example_customer", "Creating or retrieving example customer", e)
   end
 end
 
@@ -736,6 +771,7 @@ post '/attach_payment_method_to_customer' do
   end
 
   begin
+    request_opts_att = connected_account_request_opts(params)
     customer_id = params[:customer_id]
     if customer_id && !customer_id.to_s.strip.empty?
       customer_id = customer_id.strip
@@ -743,13 +779,13 @@ post '/attach_payment_method_to_customer' do
     else
       customer_email = params[:email] || params[:receipt_email]
       puts "[#{ts}] No customer_id provided — resolving via email=#{customer_email.inspect}"
-      customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email)
+      customer_id = lookup_or_create_customer(customer_email, nil, request_opts_att)
       puts "[#{ts}] Resolved customer_id=#{customer_id}"
     end
 
     attach_params = { customer: customer_id }
-    log_stripe_request("POST /attach_payment_method_to_customer", "Stripe::PaymentMethod.attach(#{payment_method_id})", attach_params, connected_account_request_opts)
-    payment_method = Stripe::PaymentMethod.attach(payment_method_id, attach_params, connected_account_request_opts)
+    log_stripe_request("POST /attach_payment_method_to_customer", "Stripe::PaymentMethod.attach(#{payment_method_id})", attach_params, request_opts_att)
+    payment_method = Stripe::PaymentMethod.attach(payment_method_id, attach_params, request_opts_att)
     log_stripe_response("POST /attach_payment_method_to_customer", "PaymentMethod (attached)", payment_method)
   rescue Stripe::StripeError => e
     status 402
@@ -771,6 +807,12 @@ end
 post '/update_payment_intent' do
   log_section("POST /update_payment_intent")
 
+  validationError = validate_api_key
+  if validationError
+    status 400
+    return log_error("POST /update_payment_intent", validationError)
+  end
+
   payment_intent_id = params["payment_intent_id"]
 
   puts "[#{ts}] Input params received:"
@@ -783,15 +825,15 @@ post '/update_payment_intent' do
     return log_error("POST /update_payment_intent", "'payment_intent_id' is a required parameter")
   end
 
-  log_connect_context("POST /update_payment_intent", "updating PaymentIntent on connected account")
+  log_connect_context("POST /update_payment_intent", "updating PaymentIntent on connected account", params)
 
   begin
     allowed_keys  = ["receipt_email"]
     update_params = params.select { |k, _| allowed_keys.include?(k) }
 
     puts "[#{ts}] Filtered update params (allowed keys only): #{update_params.inspect}"
-    log_stripe_request("POST /update_payment_intent", "Stripe::PaymentIntent.update(#{payment_intent_id})", update_params, connected_account_request_opts)
-    payment_intent = Stripe::PaymentIntent.update(payment_intent_id, update_params, connected_account_request_opts)
+    log_stripe_request("POST /update_payment_intent", "Stripe::PaymentIntent.update(#{payment_intent_id})", update_params, connected_account_request_opts(params))
+    payment_intent = Stripe::PaymentIntent.update(payment_intent_id, update_params, connected_account_request_opts(params))
     log_stripe_response("POST /update_payment_intent", "PaymentIntent (updated)", payment_intent)
   rescue Stripe::StripeError => e
     status 402
@@ -800,7 +842,7 @@ post '/update_payment_intent' do
 
   response_payload = { :intent => payment_intent.id, :secret => payment_intent.client_secret }
   puts "[#{ts}] SUCCESS  payment_intent_id=#{payment_intent_id} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  puts "[#{ts}] Response to client: { intent: '#{payment_intent.id}', secret: '#{mask_secret(payment_intent.client_secret)}' }"
   status 200
   return response_payload.to_json
 end
@@ -812,8 +854,8 @@ end
 post '/create_recurring_payment' do
   log_section("POST /create_recurring_payment")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_recurring_payment", validationError)
   end
@@ -844,10 +886,10 @@ post '/create_recurring_payment' do
     return log_error("POST /create_recurring_payment", "'amount' is required")
   end
 
-  log_connect_context("POST /create_recurring_payment", "creating off-session PaymentIntent for saved card_present")
+  log_connect_context("POST /create_recurring_payment", "creating off-session PaymentIntent for saved card_present", params)
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     # generated_card payment methods are of type 'card' (not 'card_present').
     # card_present requires the physical card to be present and cannot be used off-session.
@@ -898,18 +940,18 @@ end
 get '/list_locations' do
   log_section("GET /list_locations")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("GET /list_locations", validationError)
   end
 
-  log_connect_context("GET /list_locations", "listing Terminal locations on connected account")
+  log_connect_context("GET /list_locations", "listing Terminal locations on connected account", params)
 
   begin
     list_params = { limit: 100 }
-    log_stripe_request("GET /list_locations", "Stripe::Terminal::Location.list", list_params, connected_account_request_opts)
-    locations = Stripe::Terminal::Location.list(list_params, connected_account_request_opts)
+    log_stripe_request("GET /list_locations", "Stripe::Terminal::Location.list", list_params, connected_account_request_opts(params))
+    locations = Stripe::Terminal::Location.list(list_params, connected_account_request_opts(params))
     puts "[#{ts}] <<< STRIPE RESPONSE  [GET /list_locations]  count=#{locations.data.size}"
     locations.data.each_with_index do |loc, i|
       puts "            [#{i}] id=#{loc.id} | display_name=#{loc.display_name}"
@@ -932,8 +974,8 @@ end
 post '/create_location' do
   log_section("POST /create_location")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_location", validationError)
   end
@@ -942,7 +984,7 @@ post '/create_location' do
   puts "            display_name : #{params[:display_name].inspect}"
   puts "            address      : #{params[:address].inspect}"
 
-  log_connect_context("POST /create_location", "creating Terminal location on connected account")
+  log_connect_context("POST /create_location", "creating Terminal location on connected account", params)
 
   begin
     location_params = {
@@ -953,8 +995,8 @@ post '/create_location' do
     puts "[#{ts}] Location params being sent to Stripe:"
     location_params.each { |k, v| puts "            #{k}: #{v.inspect}" }
 
-    log_stripe_request("POST /create_location", "Stripe::Terminal::Location.create", location_params, connected_account_request_opts)
-    location = Stripe::Terminal::Location.create(location_params, connected_account_request_opts)
+    log_stripe_request("POST /create_location", "Stripe::Terminal::Location.create", location_params, connected_account_request_opts(params))
+    location = Stripe::Terminal::Location.create(location_params, connected_account_request_opts(params))
     log_stripe_response("POST /create_location", "Terminal::Location", location)
   rescue Stripe::StripeError => e
     status 402
@@ -994,8 +1036,8 @@ end
 post '/create_payment_intent_for_subscription' do
   log_section("POST /create_payment_intent_for_subscription")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_payment_intent_for_subscription", validationError)
   end
@@ -1016,13 +1058,13 @@ post '/create_payment_intent_for_subscription' do
     return log_error("POST /create_payment_intent_for_subscription", "'amount' is required")
   end
 
-  log_connect_context("POST /create_payment_intent_for_subscription", "creating subscription-ready PaymentIntent")
+  log_connect_context("POST /create_payment_intent_for_subscription", "creating subscription-ready PaymentIntent", params)
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     puts "[#{ts}] --- Step 1: Resolve/create customer ---"
-    customer_id = lookupOrCreateCustomerOnConnectedAccount(customer_email, customer_name)
+    customer_id = lookup_or_create_customer(customer_email, customer_name, request_opts)
     puts "[#{ts}] Customer resolved: #{customer_id}"
 
     pi_params = {
@@ -1054,7 +1096,7 @@ post '/create_payment_intent_for_subscription' do
     :customer_id => customer_id,
   }
   puts "[#{ts}] SUCCESS  payment_intent_id=#{payment_intent.id} | customer_id=#{customer_id} | account=#{CONNECTED_ACCOUNT_ID}"
-  puts "[#{ts}] Response to client: #{response_payload.to_json}"
+  puts "[#{ts}] Response to client: { intent: '#{payment_intent.id}', secret: '#{mask_secret(payment_intent.client_secret)}', customer_id: '#{customer_id}' }"
   status 200
   content_type :json
   return response_payload.to_json
@@ -1079,8 +1121,8 @@ end
 get '/get_payment_intent' do
   log_section("GET /get_payment_intent")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("GET /get_payment_intent", validationError)
   end
@@ -1095,14 +1137,14 @@ get '/get_payment_intent' do
     return log_error("GET /get_payment_intent", "'payment_intent_id' is required")
   end
 
-  log_connect_context("GET /get_payment_intent", "retrieving PaymentIntent with latest_charge expanded")
+  log_connect_context("GET /get_payment_intent", "retrieving PaymentIntent with latest_charge expanded", params)
 
   begin
-    request_opts = connected_account_request_opts
-    retrieve_params = { expand: ['latest_charge'] }
+    request_opts = connected_account_request_opts(params)
+    retrieve_params = { id: payment_intent_id, expand: ['latest_charge'] }
 
     log_stripe_request("GET /get_payment_intent", "Stripe::PaymentIntent.retrieve(#{payment_intent_id})", retrieve_params, request_opts)
-    payment_intent = Stripe::PaymentIntent.retrieve({ id: payment_intent_id, expand: ['latest_charge'] }, request_opts)
+    payment_intent = Stripe::PaymentIntent.retrieve(retrieve_params, request_opts)
     log_stripe_response("GET /get_payment_intent", "PaymentIntent (expanded)", payment_intent)
   rescue Stripe::StripeError => e
     status 402
@@ -1153,8 +1195,8 @@ end
 get '/list_customer_payment_methods' do
   log_section("GET /list_customer_payment_methods")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("GET /list_customer_payment_methods", validationError)
   end
@@ -1167,12 +1209,12 @@ get '/list_customer_payment_methods' do
   puts "            email       : #{email.inspect}"
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     if customer_id.nil? || customer_id.to_s.strip.empty?
       if email && !email.to_s.strip.empty?
         puts "[#{ts}] No customer_id — resolving via email=#{email}"
-        customer_id = lookupOrCreateCustomerOnConnectedAccount(email)
+        customer_id = lookup_or_create_customer(email, nil, request_opts)
       else
         status 400
         return log_error("GET /list_customer_payment_methods", "'customer_id' or 'email' is required")
@@ -1186,7 +1228,7 @@ get '/list_customer_payment_methods' do
 
     puts "[#{ts}] Found #{payment_methods.data.size} saved card(s) for customer_id=#{customer_id}"
     payment_methods.data.each_with_index do |pm, i|
-      card = pm.card rescue nil
+      card = pm.respond_to?(:card) ? pm.card : nil
       puts "            [#{i}] pm_id=#{pm.id} | brand=#{card&.brand} | last4=#{card&.last4} | exp=#{card&.exp_month}/#{card&.exp_year}"
     end
   rescue Stripe::StripeError => e
@@ -1197,7 +1239,7 @@ get '/list_customer_payment_methods' do
   response_payload = {
     :customer_id     => customer_id,
     :payment_methods => payment_methods.data.map do |pm|
-      card = pm.card rescue nil
+      card = pm.respond_to?(:card) ? pm.card : nil
       {
         :id         => pm.id,
         :brand      => card&.brand,
@@ -1239,8 +1281,8 @@ end
 post '/create_subscription' do
   log_section("POST /create_subscription")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /create_subscription", validationError)
   end
@@ -1275,10 +1317,10 @@ post '/create_subscription' do
     return log_error("POST /create_subscription", "Either 'price_id' or 'amount' is required")
   end
 
-  log_connect_context("POST /create_subscription", "creating Stripe Subscription on connected account")
+  log_connect_context("POST /create_subscription", "creating Stripe Subscription on connected account", params)
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     # ── Step 1: Set the payment method as the customer's default ──────────────
     puts "[#{ts}] --- Step 1: Set default payment method on customer ---"
@@ -1342,8 +1384,8 @@ post '/create_subscription' do
     return log_error("POST /create_subscription", "Failed to create Subscription", e)
   end
 
-  latest_invoice     = subscription.latest_invoice rescue nil
-  latest_pi_status   = latest_invoice&.payment_intent&.status rescue nil
+  latest_invoice   = subscription.respond_to?(:latest_invoice) ? subscription.latest_invoice : nil
+  latest_pi_status = latest_invoice&.payment_intent&.status
 
   response_payload = {
     :subscription_id          => subscription.id,
@@ -1377,8 +1419,8 @@ end
 get '/list_subscriptions' do
   log_section("GET /list_subscriptions")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("GET /list_subscriptions", validationError)
   end
@@ -1396,7 +1438,7 @@ get '/list_subscriptions' do
   end
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
     list_params  = { customer: customer_id, limit: 20 }
     list_params[:status] = sub_status unless sub_status == 'all'
 
@@ -1416,7 +1458,7 @@ get '/list_subscriptions' do
   response_payload = {
     :customer_id  => customer_id,
     :subscriptions => subscriptions.data.map do |sub|
-      item = sub.items&.data&.first rescue nil
+      item = sub.items&.data&.first
       {
         :id                   => sub.id,
         :status               => sub.status,
@@ -1452,8 +1494,8 @@ end
 post '/cancel_subscription' do
   log_section("POST /cancel_subscription")
 
-  validationError = validateApiKey
-  if !validationError.nil?
+  validationError = validate_api_key
+  if validationError
     status 400
     return log_error("POST /cancel_subscription", validationError)
   end
@@ -1470,10 +1512,10 @@ post '/cancel_subscription' do
     return log_error("POST /cancel_subscription", "'subscription_id' is required")
   end
 
-  log_connect_context("POST /cancel_subscription", "canceling Stripe Subscription on connected account")
+  log_connect_context("POST /cancel_subscription", "canceling Stripe Subscription on connected account", params)
 
   begin
-    request_opts = connected_account_request_opts
+    request_opts = connected_account_request_opts(params)
 
     if cancel_at_period_end
       puts "[#{ts}] Canceling at period end (update cancel_at_period_end=true)"
