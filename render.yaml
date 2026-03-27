@@ -15,5 +15,7 @@ services:
         value: production
       - key: STRIPE_SECRET_KEY
         sync: false # REQUIRED: Set your LIVE Stripe secret key (sk_live_...) in the dashboard
-      - key: STRIPE_TEST_SECRET_KEY
-        sync: false # Optional: Set your TEST Stripe secret key (sk_test_...) for development/testing
+      - key: STRIPE_CONNECTED_ACCOUNT_ID
+        sync: false # REQUIRED: Your Stripe Connect account ID (acct_...) from dashboard.stripe.com/settings/account
+      - key: STRIPE_ALLOW_PARAM_ACCOUNT_ID
+        sync: false # Optional: Set to 'true' only for multi-tenant direct-charge flows
