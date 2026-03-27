@@ -18,8 +18,12 @@
       "description": "Your Stripe LIVE secret key (starts with sk_live_...). Required for production. Find it at https://dashboard.stripe.com/account/apikeys",
       "required": true
     },
-    "STRIPE_TEST_SECRET_KEY": {
-      "description": "Your Stripe TEST secret key (starts with sk_test_...). Used when STRIPE_ENV=test. Find it at https://dashboard.stripe.com/account/apikeys",
+    "STRIPE_CONNECTED_ACCOUNT_ID": {
+      "description": "Your Stripe Connect account ID (starts with acct_...). Required. Find it at https://dashboard.stripe.com/settings/account",
+      "required": true
+    },
+    "STRIPE_ALLOW_PARAM_ACCOUNT_ID": {
+      "description": "Set to 'true' to allow the stripe_account_id param in requests (multi-tenant direct charges only). Default: false",
       "required": false
     }
   }
