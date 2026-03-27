@@ -26,7 +26,7 @@ STRIPE_ENV = ENV['STRIPE_ENV'] || (PRODUCTION ? 'production' : 'test')
 if STRIPE_ENV == 'production'
   Stripe.api_key = ENV['STRIPE_SECRET_KEY'] || ENV['STRIPE_LIVE_SECRET_KEY']
 else
-  Stripe.api_key = ENV['STRIPE_TEST_SECRET_KEY']
+  Stripe.api_key = ENV['STRIPE_SECRET_KEY']
 end
 Stripe.api_version = '2024-09-30.acacia'
 
@@ -183,7 +183,7 @@ puts LOG_SEP
 puts "  RACK_ENV           : #{ENV['RACK_ENV'].inspect}"
 puts "  ENVIRONMENT        : #{ENV['ENVIRONMENT'].inspect}"
 puts "  PRODUCTION (host)  : #{PRODUCTION}  ← true when RACK_ENV or ENVIRONMENT is production"
-puts "  STRIPE_ENV         : #{STRIPE_ENV}  ← live keys when production; else STRIPE_TEST_SECRET_KEY"
+puts "  STRIPE_ENV         : #{STRIPE_ENV}  ← uses STRIPE_SECRET_KEY (sk_live in production, sk_test in test)"
 puts "  Stripe API version : #{Stripe.api_version}"
 puts "  Connected account  : #{CONNECTED_ACCOUNT_ID}"
 puts "  Allow param acct   : #{STRIPE_ALLOW_PARAM_ACCOUNT_ID} (STRIPE_ALLOW_PARAM_ACCOUNT_ID=true → honor request stripe_account_id)"
